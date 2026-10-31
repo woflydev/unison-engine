@@ -1,0 +1,43 @@
+{
+  "serial": 2,
+  "client_version": "0.0.420",
+  "release_channel": "stable",
+  "electron_version": "44.9.3",
+  "chrome_version": "152.0.7977.167",
+  "client_build_number": 655747,
+  "native_build_number": null,
+  "api_version": 9,
+  "gateway_capabilities": 1734653,
+  "api_base": "https://discord.com/api/v9",
+  "gateway_url": "wss://gateway.discord.gg",
+  "remote_auth_url": "wss://remote-auth-gateway.discord.gg/?v=2",
+  "sec_ch_ua": "\"Not?A_Brand\";v=\"24\", \"Chromium\";v=\"152\"",
+  "rest_header_order": [
+    "content-length",
+    "sec-ch-ua-platform",
+    "authorization",
+    "x-debug-options",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "x-discord-timezone",
+    "x-super-properties",
+    "x-discord-locale",
+    "user-agent",
+    "content-type",
+    "accept",
+    "origin",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+    "referer",
+    "accept-encoding",
+    "accept-language",
+    "cookie",
+    "priority"
+  ],
+  "web_fallback_features": [],
+  "notes": {
+    "source": "Installed Discord 0.0.420 (Electron 44.9.3, Chrome 152.0.7977.167) + discord.com/app build 655747 (2026-10-30)",
+    "rest_header_order": "inferred from Chromium fetch behaviour; verify by capture"
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "unison-etf"
+description = "Erlang External Term Format codec matching Discord's erlpack, with serde support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
