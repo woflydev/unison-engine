@@ -110,6 +110,11 @@ impl Rest {
         self.get(&path).await
     }
 
+    /// The page of messages after `after` (a detached window growing towards the present).
+    pub async fn messages_after(&self, channel: Id, after: Id, limit: u8) -> Result<Vec<Message>> {
+        self.get(&format!("/channels/{channel}/messages?after={after}&limit={limit}")).await
+    }
+
     pub async fn messages_around(&self, channel: Id, around: Id) -> Result<Vec<Message>> {
         self.get(&format!(
             "/channels/{channel}/messages?around={around}&limit=50"
@@ -120,22 +125,6 @@ impl Rest {
     pub async fn pins(&self, channel: Id) -> Result<Value> {
         self.get(&format!("/channels/{channel}/messages/pins?limit=50"))
             .await
-    }
-
-    pub async fn search_guild(&self, guild: Id, query: &str) -> Result<Value> {
-        self.get(&format!(
-            "/guilds/{guild}/messages/search?content={}",
-            encode(query)
-        ))
-        .await
-    }
-
-    pub async fn search_channel(&self, channel: Id, query: &str) -> Result<Value> {
-        self.get(&format!(
-            "/channels/{channel}/messages/search?content={}",
-            encode(query)
-        ))
-        .await
     }
 
     pub async fn send_message(

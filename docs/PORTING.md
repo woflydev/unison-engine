@@ -36,6 +36,7 @@ Rows 1-5 of the first audit are done (see below). What remains:
 | 5 | `DevTools.swift`, `scripts/perf`, packaging scripts | macOS-only tooling | Per-platform by nature; keep the budgets shared |
 | 6 | `Release.swift` update-check timing (`UserDefaults` last check) | Behavioural persistence in the shell | Core `kv` + `update_check_due`; also the `update.beta` channel switch (`Update.swift`) |
 | 7 | `UpdateInstaller.swift`, `update-swap.sh` | Mount, copy, codesign, swap and relaunch are OS work | Per-platform by nature; the rules are in `update_install.rs` |
+| 8 | `AppModel.sidebarOpen`, `sidebarColumnWidth`, `Dock` and `ChatTitle` (`RootView.swift`, `DesignSystem.swift`) | Pane open/closed and width are UI-only prefs; the dock and title layout are window chrome; the title's trailing reserve and leading clearance are constants for the macOS toolbar | Fine in the shell; another shell draws its own chrome. Keep the rule (one owned width, interruptible, chat follows the live edge) |
 
 Update and restart (what another shell implements). The core owns every rule and sentence (`update.rs`, `update_install.rs`, `unison-ffi/src/release.rs`); a shell supplies only the OS half:
 1. Fetch the feed at `update_feed_url(base, channel)`, pass the body to `verify_appcast(json, version, build, UpdatePlatform{os, arch, os_version}, channel)`; it returns the asset for this OS and CPU (`macos`/`windows`/`linux`, `arm64`/`x86_64`) or nothing. Add the platform's assets to the feed (`assets[]`, see `docs/RELEASING.md`).

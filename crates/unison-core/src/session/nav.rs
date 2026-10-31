@@ -102,7 +102,25 @@ impl Session {
         self.rest.mentions(before, 25, guild, true, true).await
     }
 
+    /// How long a Discord search page stays good: the same search inside this window is answered
+    /// from memory (ARCHITECTURE rule 10). A search is only ever sent on a gesture, never faster
+    /// than a person asks, and never while automation is on (`rest::set_automation`).
+    pub const SEARCH_FRESH: std::time::Duration = std::time::Duration::from_secs(45);
+
     pub async fn search_filtered(&self, guild: Option<Id>, channel: Id, q: &SearchQuery) -> Result<Value> {
-        self.rest.search(guild, channel, q).await
+        let key = format!("{guild:?}/{channel}?{}", q.to_query());
+        if let Some(v) = self.search_pages.lock().get(&key, Self::SEARCH_FRESH) {
+            return Ok(v);
+        }
+        let flight = format!("search:{key}");
+        if !self.reads.begin(&flight, std::time::Duration::ZERO) {
+            return Err(Error::Other("That search is already running.".into()));
+        }
+        let r = self.rest.search(guild, channel, q).await;
+        self.reads.finish(&flight, false);
+        if let Ok(v) = &r {
+            self.search_pages.lock().put(key, v.clone());
+        }
+        r
     }
 }

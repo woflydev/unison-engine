@@ -42,6 +42,8 @@ impl UnisonEngine {
     pub fn nav_visit(&self, account_id: String, guild_id: Option<String>, channel_id: String, from_history: bool) {
         if let Some(s) = self.inner.session(id(&account_id)) {
             s.nav_visit(guild_id.as_deref().map(id), id(&channel_id), from_history);
+            // The search surface ranks and lists by what was opened (docs/UX.md 8: every open path ends here).
+            self.inner.local.record_visit(&account_id, guild_id.as_deref(), &channel_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64));
         }
     }
 
@@ -175,8 +177,10 @@ impl UnisonEngine {
             &query,
             tz_offset_secs,
             |name| {
-                let hit = self.find_users(account_id.clone(), name.to_string(), 5).into_iter().find(|u| u.username.eq_ignore_ascii_case(name));
-                hit.or_else(|| self.find_users(account_id.clone(), name.to_string(), 1).into_iter().next()).map(|u| u.user_id)
+                // An exact username wins; otherwise the best fuzzy match (friend nickname, server
+                // nickname, global name, username).
+                let hit = self.find_users(account_id.clone(), name.to_string(), 5);
+                hit.iter().find(|u| u.username.eq_ignore_ascii_case(name)).or(hit.first()).map(|u| u.user_id.clone())
             },
             |name| channels.iter().find(|c| c.name.eq_ignore_ascii_case(name)).map(|c| c.id.clone()),
         );

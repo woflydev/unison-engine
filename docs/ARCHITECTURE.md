@@ -46,6 +46,7 @@ Each is a narrow interface; a new platform implements it and nothing else change
 - [ ] Are new request bodies in `rest/` and noted in `docs/FIDELITY.md` (`capture` if guessed)?
 - [ ] Core tests added; `cargo test --workspace` passes; the shell builds.
 - [ ] If a shell exception was unavoidable, is it listed in the debt table of `docs/PORTING.md` with why?
+- [ ] Where a place lives (server, category, thread parent, link target) is a core answer (`open_target`), not something a shell derives from a row or a hint (UX.md 8).
 - [ ] **Whole-feature check (UX.md 0):** did I update every other implementation and every consumer of what I changed (other lists, panes, popovers, the other shell, fixtures, tests, docs), not just the spot I was looking at?
 
 ## 5b. No self-bot behaviour (binding)

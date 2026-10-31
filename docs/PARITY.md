@@ -12,7 +12,7 @@ Added: audit-log reasons (`X-Audit-Log-Reason`, `capture`), member role assignme
 
 Servers can be created and joined from the "+" at the bottom of the rail (`server_join.rs`, `create_server`, `join_server`, `preview_invite`). Request bodies are `capture`; joining may be answered with a captcha, which currently surfaces as an error (route to the web fallback if it happens).
 
-Search (2026-10-30): toolbar search has core-defined scopes (this server / this channel or chat / everywhere; `search_scopes`, `Scope`), Return asks Discord only where that is possible; ⌘K also lists matching messages from every account's local history (`SwitchKind::Message`). Embeds flagged by the content scan are covered like attachments (`capture`: embed flag bit 4).
+Search (2026-11-01): one panel for ⌘K and ⌘F (`find_local` places/people/messages, `find_discord` pages of 25); on-device index prefix-matched and accent-blind; Discord asked only on request. Older note (2026-10-30): toolbar search has core-defined scopes (this server / this channel or chat / everywhere; `search_scopes`, `Scope`), Return asks Discord only where that is possible; ⌘K also lists matching messages from every account's local history (`SwitchKind::Message`). Embeds flagged by the content scan are covered like attachments (`capture`: embed flag bit 4).
 
 UI cleanup (2026-10-30): Friends panel, Add Friend, status editor, events, message requests moved onto design-system components (`StatusPill` added); window now enforces its minimum size (`contentMinSize`). Not yet checked by eye at minimum width.
 

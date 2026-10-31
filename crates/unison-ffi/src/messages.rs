@@ -313,9 +313,10 @@ pub(crate) fn preview_text(s: &Store, guild: Option<Id>, src: &str, max: usize) 
     plain(s, guild, src).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max).collect()
 }
 
-/// `src` with mentions resolved and markdown flattened, otherwise unshortened.
+/// `src` with mentions resolved and markdown flattened, otherwise unshortened. Spoilers stay
+/// hidden (a block per run): a one-line preview must not give away what the author covered.
 fn plain(s: &Store, guild: Option<Id>, src: &str) -> String {
-    unison_markdown::render_with(src, &StoreResolver { s, guild }).text
+    unison_markdown::render_with(src, &StoreResolver { s, guild }).masked_text()
 }
 
 pub(crate) fn rich(s: &Store, guild: Option<Id>, src: &str) -> RichText {
@@ -689,6 +690,62 @@ impl UnisonEngine {
         .unwrap_or(true)
     }
 
+    /// Should "Jump to present" be on screen? The one rule (`unison_core::jump_present`): the
+    /// shell reports how much loaded transcript lies below the viewport and whether the control
+    /// shows now (hysteresis); the core adds whether the window is the newest page and how far
+    /// in time its end is from the channel's latest message.
+    pub fn jump_to_present_visible(&self, account_id: String, channel_id: String, screens_below: f64, messages_below: u32, shown: bool) -> bool {
+        self.with_store(&account_id, |s| {
+            let c = id(&channel_id);
+            let at_latest = s.history.get(&c).is_none_or(|h| h.at_latest);
+            unison_core::jump_present::should_show(&unison_core::jump_present::Reading {
+                at_latest,
+                screens_below: screens_below as f32,
+                messages_below,
+                tail_ms: s.window_tail_ms(c),
+                shown,
+            })
+        })
+        .unwrap_or(false)
+    }
+
+    /// DevTools only (refuses unless automation is on, i.e. an offline scripted run): make the
+    /// loaded window of a channel look like a page around an old message, `tail_minutes` before
+    /// the channel's newest message. Lets the shell's jump-to-present be checked without REST.
+    pub fn dev_detach_window(&self, account_id: String, channel_id: String, tail_minutes: u32) -> bool {
+        if !unison_core::rest::AUTOMATION.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let Some(session) = self.inner.session(id(&account_id)) else { return false };
+        let mut guard = session.store.write();
+        let s = &mut *guard;
+        {
+            let c = id(&channel_id);
+            let Some(newest) = s.history.get(&c).and_then(|h| h.messages.back().map(|m| m.id)) else { return false };
+            let later = newest.0 + (u64::from(tail_minutes) * 60_000 << 22);
+            if let Some(ch) = s.channels.get_mut(&c) {
+                ch.last_message_id = Some(unison_core::snowflake::Snowflake(later));
+            }
+            if let Some(h) = s.history.get_mut(&c) {
+                h.at_latest = false;
+            }
+            true
+        }
+    }
+
+    /// A detached window (opened around a message) grows by one page towards the present.
+    pub fn load_newer(&self, account_id: String, channel_id: String) {
+        let Some(s) = self.inner.session(id(&account_id)) else {
+            return;
+        };
+        let listener = self.listener.clone();
+        self.inner.rt.spawn(async move {
+            if let Err(e) = s.load_newer(id(&channel_id)).await {
+                listener.on_error(account_id, e.user_message());
+            }
+        });
+    }
+
     pub fn typing_names(&self, account_id: String, channel_id: String) -> Vec<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -951,19 +1008,6 @@ impl UnisonEngine {
                     listener.on_reaction_emoji(account_id, emoji);
                 }
                 Err(e) => listener.on_error(account_id, e.user_message()),
-            }
-        });
-    }
-
-    /// Jump to a specific message (search result, pin, inbox): loads the page around it.
-    pub fn jump_to_message(&self, account_id: String, channel_id: String, message_id: String) {
-        let Some(s) = self.inner.session(id(&account_id)) else {
-            return;
-        };
-        let listener = self.listener.clone();
-        self.inner.rt.spawn(async move {
-            if let Err(e) = s.load_around(id(&channel_id), id(&message_id)).await {
-                listener.on_error(account_id, e.user_message());
             }
         });
     }

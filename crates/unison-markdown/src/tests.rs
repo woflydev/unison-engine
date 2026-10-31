@@ -181,3 +181,15 @@ fn shortcodes_become_emoji() {
     }
     assert_eq!(render_with("a :bulb: b :nope: c: d:e", &R).text, "a 💡 b :nope: c: d:e");
 }
+
+#[test]
+fn masked_text_hides_spoilers_only() {
+    use crate::render;
+    assert_eq!(render("plain **bold** text").masked_text(), "plain bold text");
+    assert_eq!(render("the end is ||the butler did it|| ok").masked_text(), "the end is \u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592}\u{2592} ok");
+    assert_eq!(render("||a|| and ||bc||").masked_text(), "\u{2592} and \u{2592}\u{2592}");
+    let m = render("x ||secret https://example.com/|| y").masked_text();
+    assert!(!m.contains("secret") && !m.contains("example"), "{m}");
+    let m = render("||**bold** and *it*||").masked_text();
+    assert!(!m.contains("bold") && !m.contains("it"), "{m}");
+}

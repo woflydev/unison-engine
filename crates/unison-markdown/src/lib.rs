@@ -251,6 +251,40 @@ pub fn render_with(src: &str, resolve: &dyn Resolve) -> Rendered {
     Rendered { text, spans, jumbo_emoji }
 }
 
+impl Rendered {
+    /// The text with every spoiler run replaced by a block of `\u{2592}`, one per character (at
+    /// most `SPOILER_MASK_MAX`), so a one-line preview (reply line, composer reply bar, Inbox,
+    /// Saved, search, notifications) never shows what the author hid. The full transcript keeps the
+    /// text and draws the cover itself; this is for surfaces that show plain text.
+    pub fn masked_text(&self) -> String {
+        let mut runs: Vec<(usize, usize)> = self.spans.iter().filter(|s| s.kind == SpanKind::Spoiler).map(|s| (s.start as usize, (s.start + s.len) as usize)).collect();
+        if runs.is_empty() {
+            return self.text.clone();
+        }
+        runs.sort_unstable();
+        let mut out = String::with_capacity(self.text.len());
+        let mut pos16 = 0usize;
+        let mut masked: Vec<(usize, usize)> = Vec::new();
+        for ch in self.text.chars() {
+            let a = pos16;
+            pos16 += ch.len_utf16();
+            match runs.iter().find(|(s, e)| a >= *s && a < *e) {
+                Some(&(s, e)) => {
+                    if !masked.iter().any(|&(ms, me)| s >= ms && e <= me) {
+                        out.extend(std::iter::repeat('\u{2592}').take((e - s).clamp(1, SPOILER_MASK_MAX)));
+                        masked.push((s, e));
+                    }
+                }
+                None => out.push(ch),
+            }
+        }
+        out
+    }
+}
+
+/// Longest block drawn for one hidden run in a plain-text preview.
+pub const SPOILER_MASK_MAX: usize = 12;
+
 fn is_jumbo(nodes: &[Node]) -> bool {
     let mut count = 0;
     for n in nodes {

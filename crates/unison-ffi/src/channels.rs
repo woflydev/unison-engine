@@ -71,6 +71,20 @@ pub struct ChannelItem {
     pub can_invite: bool,
     /// The user may drag this channel to another place in the list (Manage Channels, a server channel).
     pub can_move: bool,
+    /// Threads: whether this account is in it, can join it, or only views it (archived).
+    pub join: ThreadJoinState,
+}
+
+/// Where this account stands in a thread (`ChannelItem.join`).
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadJoinState {
+    /// Not a thread.
+    NotThread,
+    Joined,
+    /// Viewing without having joined: the composer area offers a Join button.
+    CanJoin,
+    /// Archived and not joined: read-only, no Join.
+    Archived,
 }
 
 pub(crate) fn guild_item(s: &Store, g: Id) -> GuildItem {
@@ -111,6 +125,12 @@ pub(crate) fn channel_item(s: &Store, c: &Channel) -> ChannelItem {
         can_send: perms & unison_core::store::perm::SEND_MESSAGES != 0,
         can_invite: perms & unison_core::store::perm::CREATE_INSTANT_INVITE != 0,
         can_move: c.guild_id.is_some() && !c.is_thread() && perms & unison_core::store::perm::MANAGE_CHANNELS != 0,
+        join: match s.thread_join(c) {
+            unison_core::store::ThreadJoin::NotThread => ThreadJoinState::NotThread,
+            unison_core::store::ThreadJoin::Joined => ThreadJoinState::Joined,
+            unison_core::store::ThreadJoin::CanJoin => ThreadJoinState::CanJoin,
+            unison_core::store::ThreadJoin::Archived => ThreadJoinState::Archived,
+        },
     }
 }
 
@@ -373,6 +393,57 @@ impl UnisonEngine {
         .flatten()
     }
 
+    /// Where a channel, thread or message lives (the one rule behind `AppModel.open`): its server,
+    /// the category to uncollapse, a thread's parent. The caller's `guild_hint` only matters when
+    /// the channel is not known at all. See `unison_core::open_target`.
+    pub fn resolve_open_target(&self, account_id: String, channel_id: String, guild_hint: Option<String>) -> OpenTargetItem {
+        use unison_core::open_target::{Missing, Resolution};
+        let hint = guild_hint.as_deref().filter(|g| !g.is_empty()).map(id);
+        let r = self
+            .with_store(&account_id, |s| unison_core::open_target::resolve(s, id(&channel_id), hint))
+            .unwrap_or(Resolution::Fallback { guild: None, why: Missing::Unknown });
+        open_target_item(&channel_id, r)
+    }
+
+    /// Make a thread this account has not joined viewable (it is not in the store): one
+    /// `GET /channels/{id}` after a real click, de-duplicated, admitted under its parent. It never
+    /// joins and never acks; joining is `set_thread_membership` from the Join button. Returns the
+    /// same answer as `resolve_open_target`, or `None` when the same
+    /// request is already in flight (the first call will open it). Without a gesture nothing is
+    /// requested. See docs/FIDELITY.md "Unjoined threads".
+    pub async fn preview_thread(&self, account_id: String, channel_id: String, guild_hint: Option<String>, gesture: Option<UserGesture>) -> Result<Option<OpenTargetItem>, FfiError> {
+        let s = account_session(self, &account_id)?;
+        let hint = guild_hint.as_deref().filter(|g| !g.is_empty()).map(id);
+        let intent = gesture.map(UserGesture::intent);
+        let r = s.preview_thread(id(&channel_id), hint, intent.as_ref()).await?;
+        Ok(r.map(|r| open_target_item(&channel_id, r)))
+    }
+
+    /// A discord.com link to a channel or message this account can open: where it points, for the
+    /// shell to open in the app. `None` for any other link (it stays a web link), and for places the
+    /// account does not know or cannot view.
+    pub fn link_target(&self, account_id: String, url: String) -> Option<LinkTargetItem> {
+        let t = unison_core::open_target::parse_link(&url)?;
+        let known = self.with_store(&account_id, |s| unison_core::open_target::link_may_be_ours(s, &t)).unwrap_or(false);
+        known.then(|| LinkTargetItem { guild_id: t.guild.map(|g| g.to_string()), channel_id: t.channel.to_string(), message_id: t.message.map(|m| m.to_string()) })
+    }
+
+    /// Open a channel around one message in a single step (selects, subscribes, loads the window
+    /// around it, or just re-announces it when it is already loaded). Falls back to the latest
+    /// page if the window cannot be loaded.
+    pub fn open_channel_at(&self, account_id: String, guild_id: Option<String>, channel_id: String, message_id: String, gesture: Option<UserGesture>) {
+        let Some(s) = self.inner.session(id(&account_id)) else {
+            return;
+        };
+        let intent = gesture.map(UserGesture::intent);
+        let listener = self.listener.clone();
+        self.inner.rt.spawn(async move {
+            if let Err(e) = s.open_channel_at(guild_id.as_deref().map(id), id(&channel_id), id(&message_id), intent).await {
+                listener.on_error(account_id, e.user_message());
+            }
+        });
+    }
+
     /// `gesture` is `None` when the shell restores a view on its own (launch); nothing is acked then.
     pub fn open_channel(
         &self,
@@ -465,4 +536,54 @@ mod rail_drop_tests {
         assert!(matches!(RailDropTarget::edit(d(), last, RailDropZone::After, &layout), Some(FolderEdit::MoveGuild { to: FolderPlace::Top { before: None }, .. })));
         assert!(matches!(RailDropTarget::edit(d(), t(), RailDropZone::Onto, &layout), Some(FolderEdit::MakeFolder { .. })));
     }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenStatus {
+    Open,
+    /// Not in the store (never joined, server not loaded).
+    Unknown,
+    /// Known, but this account cannot view it.
+    Hidden,
+}
+
+/// The answer to "where does this channel live" (`resolve_open_target`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct OpenTargetItem {
+    pub status: OpenStatus,
+    /// The server to show: the channel's own when `Open`, the caller's known-good guess otherwise.
+    pub guild_id: Option<String>,
+    pub channel_id: String,
+    pub parent_id: Option<String>,
+    pub category_id: Option<String>,
+}
+
+fn open_target_item(channel_id: &str, r: unison_core::open_target::Resolution) -> OpenTargetItem {
+    use unison_core::open_target::{Missing, Resolution};
+    let none = |status, guild: Option<unison_core::model::Id>| OpenTargetItem {
+        status,
+        guild_id: guild.map(|g| g.to_string()),
+        channel_id: channel_id.to_string(),
+        parent_id: None,
+        category_id: None,
+    };
+    match r {
+        Resolution::Open(t) => OpenTargetItem {
+            status: OpenStatus::Open,
+            guild_id: t.guild.map(|g| g.to_string()),
+            channel_id: t.channel.to_string(),
+            parent_id: t.parent.map(|p| p.to_string()),
+            category_id: t.category.map(|c| c.to_string()),
+        },
+        Resolution::Fallback { guild, why: Missing::Unknown } => none(OpenStatus::Unknown, guild),
+        Resolution::Fallback { guild, why: Missing::Hidden } => none(OpenStatus::Hidden, guild),
+    }
+}
+
+/// Where a discord.com link points (`link_target`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct LinkTargetItem {
+    pub guild_id: Option<String>,
+    pub channel_id: String,
+    pub message_id: Option<String>,
 }

@@ -40,11 +40,13 @@ struct Drafts {
 pub struct LocalState {
     db: Cache,
     drafts: Mutex<Drafts>,
+    /// Places opened, for the search surface's recents and ranking (loaded on first use).
+    visits: Mutex<Option<crate::find::Recents>>,
 }
 
 impl LocalState {
     pub fn open(dir: &Path) -> Result<Self> {
-        Ok(Self { db: Cache::open(&dir.join("local.sqlite"))?, drafts: Mutex::new(Drafts::default()) })
+        Ok(Self { db: Cache::open(&dir.join("local.sqlite"))?, drafts: Mutex::new(Drafts::default()), visits: Mutex::new(None) })
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Option<T> {
@@ -97,6 +99,27 @@ impl LocalState {
         if let Some(m) = snapshot {
             self.put("drafts", &m);
         }
+    }
+
+    // ----- Places opened (search recents and ranking) -----
+
+    fn with_visits<R>(&self, f: impl FnOnce(&mut crate::find::Recents) -> R) -> R {
+        let mut g = self.visits.lock();
+        let r = g.get_or_insert_with(|| self.get("visits").unwrap_or_default());
+        f(r)
+    }
+
+    /// Note that a channel was opened (by any means: click, search, link, history).
+    pub fn record_visit(&self, account: &str, guild: Option<&str>, channel: &str, now_ms: u64) {
+        let snapshot = self.with_visits(|r| {
+            r.record(account, guild, channel, now_ms);
+            r.clone()
+        });
+        self.put("visits", &snapshot);
+    }
+
+    pub fn recents(&self) -> crate::find::Recents {
+        self.with_visits(|r| r.clone())
     }
 
     // ----- Reactions -----
@@ -204,7 +227,7 @@ mod tests {
     use super::*;
 
     fn state() -> LocalState {
-        LocalState { db: Cache::in_memory().unwrap(), drafts: Mutex::new(Drafts::default()) }
+        LocalState { db: Cache::in_memory().unwrap(), drafts: Mutex::new(Drafts::default()), visits: Mutex::new(None) }
     }
 
     #[test]

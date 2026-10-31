@@ -40,6 +40,7 @@ mod channels;
 mod comfort;
 mod composer;
 mod dms;
+mod find;
 mod forums;
 mod interactions;
 mod lists;
@@ -69,6 +70,7 @@ pub use accounts::*;
 pub use channels::*;
 pub use composer::*;
 pub use dms::*;
+pub use find::*;
 pub use forums::*;
 pub use interactions::*;
 pub use messages::*;
@@ -315,18 +317,4 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fuzzy;
-
-    #[test]
-    fn fuzzy_prefers_prefix_and_word_starts() {
-        let a = fuzzy("gen", "general").unwrap();
-        let b = fuzzy("gen", "off-topic-gen").unwrap();
-        let c = fuzzy("gen", "garden-news").unwrap();
-        assert!(a > b && b > c);
-        assert!(fuzzy("xyz", "general").is_none());
-    }
 }

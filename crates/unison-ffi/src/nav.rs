@@ -49,25 +49,8 @@ pub struct SearchFilters {
     pub oldest: bool,
 }
 
-#[derive(uniffi::Record, Clone, Debug)]
-pub struct SearchResult {
-    pub channel_id: String,
-    pub message_id: String,
-    pub author: String,
-    pub avatar_url: String,
-    pub content: String,
-    pub location: String,
-    pub timestamp_ms: u64,
-}
-
-#[derive(uniffi::Record, Clone, Debug)]
-pub struct SearchPage {
-    pub total: u32,
-    pub results: Vec<SearchResult>,
-}
-
 impl SearchFilters {
-    fn query(&self) -> SearchQuery {
+    pub(crate) fn query(&self) -> SearchQuery {
         let ids = |v: &Vec<String>| v.iter().map(|s| id(s)).collect::<Vec<_>>();
         SearchQuery {
             content: self.content.clone(),
@@ -301,45 +284,6 @@ impl UnisonEngine {
             .map_err(|e| FfiError::Failed { message: e.to_string() })?
             .map_err(Into::into)
     }
-
-    /// Filtered search in a guild (or the DM `channel_id` when `guild_id` is None).
-    pub async fn search_messages(
-        &self,
-        account_id: String,
-        guild_id: Option<String>,
-        channel_id: String,
-        filters: SearchFilters,
-    ) -> Result<SearchPage, FfiError> {
-        let s = self
-            .inner
-            .session(id(&account_id))
-            .ok_or_else(|| FfiError::Failed { message: "no such account".into() })?;
-        let jh = self.inner.rt.spawn(async move {
-            let v = s.search_filtered(guild_id.as_deref().map(id), id(&channel_id), &filters.query()).await?;
-            let st = s.store.read();
-            let mut results = Vec::new();
-            for group in v["messages"].as_array().into_iter().flatten() {
-                // Each group is context around a hit; the hit carries `hit: true`.
-                let hit = group
-                    .as_array()
-                    .and_then(|g| g.iter().find(|m| m["hit"] == true).or_else(|| g.first()));
-                let Some(m) = hit.and_then(|m| serde_json::from_value::<Message>(m.clone()).ok()) else { continue };
-                results.push(SearchResult {
-                    channel_id: m.channel_id.to_string(),
-                    message_id: m.id.to_string(),
-                    author: m.author.display_name().to_string(),
-                    avatar_url: m.author.avatar_url(64),
-                    content: messages::preview_text(&st, st.channels.get(&m.channel_id).and_then(|c| c.guild_id), &m.content, 400),
-                    location: messages::location(&st, m.channel_id),
-                    timestamp_ms: m.id.timestamp_ms(),
-                });
-            }
-            Ok::<_, unison_core::Error>(SearchPage { total: v["total_results"].as_u64().unwrap_or(0) as u32, results })
-        });
-        jh.await
-            .map_err(|e| FfiError::Failed { message: e.to_string() })?
-            .map_err(Into::into)
-    }
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -363,23 +307,19 @@ impl UnisonEngine {
     pub fn find_users(&self, account_id: String, prefix: String, limit: u32) -> Vec<UserRef> {
         let p = prefix.trim_start_matches('@').to_lowercase();
         self.with_store(&account_id, |s| {
-            let mut v: Vec<UserRef> = s
-                .users
-                .values()
-                .filter(|u| {
-                    !u.bot
-                        && (p.is_empty()
-                            || u.username.to_lowercase().starts_with(&p)
-                            || u.display_name().to_lowercase().starts_with(&p))
-                })
-                .map(|u| UserRef {
-                    user_id: u.id.to_string(),
-                    name: u.display_name().to_string(),
-                    username: u.username.clone(),
-                    avatar_url: u.avatar_url(64),
-                })
-                .collect();
-            v.sort_by_key(|u| u.name.to_lowercase());
+            let to_ref = |u: &unison_core::model::User| UserRef {
+                user_id: u.id.to_string(),
+                name: s.friend_nicks.get(&u.id).cloned().unwrap_or_else(|| u.display_name().to_string()),
+                username: u.username.clone(),
+                avatar_url: u.avatar_url(64),
+            };
+            let mut v: Vec<UserRef> = if p.is_empty() {
+                let mut all: Vec<UserRef> = s.users.values().filter(|u| !u.bot).map(to_ref).collect();
+                all.sort_by_key(|u| u.name.to_lowercase());
+                all
+            } else {
+                s.users_matching(&p).into_iter().filter_map(|(id, _)| s.users.get(&id)).map(to_ref).collect()
+            };
             v.truncate(limit as usize);
             v
         })

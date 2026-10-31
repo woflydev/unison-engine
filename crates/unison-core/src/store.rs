@@ -268,6 +268,33 @@ pub struct Store {
     pub voice: VoiceCall,
 }
 
+/// Whether the account is in a thread, and if not whether it could join (the composer area's bar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadJoin {
+    NotThread,
+    Joined,
+    /// Viewing a thread without being in it: a Join button, one click, is the only way in.
+    CanJoin,
+    /// Archived and not joined: Discord only lets you join an active thread (capture: whether the
+    /// official client offers Join here), so it is read-only until someone posts and reopens it.
+    Archived,
+}
+
+/// What a thread allows, from what its parent channel allows (`p`), as the official client
+/// computes it: a private thread you are not in is invisible without Manage Threads; sending
+/// takes Send Messages in Threads, and a locked thread also takes Manage Threads.
+fn thread_permissions(thread: &Channel, p: u64) -> u64 {
+    if p == perm::ALL {
+        return p;
+    }
+    let manage = p & perm::MANAGE_THREADS != 0;
+    if thread.kind == channel_type::PRIVATE_THREAD && thread.member.is_none() && !manage {
+        return 0;
+    }
+    let send = p & perm::SEND_MESSAGES_IN_THREADS != 0 && (!thread.is_locked() || manage);
+    if send { p | perm::SEND_MESSAGES } else { p & !perm::SEND_MESSAGES }
+}
+
 impl Store {
     pub fn my_id(&self) -> Option<Id> {
         self.me.as_ref().map(|u| u.id)
@@ -1619,6 +1646,61 @@ impl Store {
         h.messages = newest_first.into();
         h.has_more_before = true;
         h.at_latest = false;
+        // The page around a recent message reaches the channel's newest one: it is the newest page.
+        self.promote_if_latest(channel);
+    }
+
+    /// The newest message the channel is known to have (READY, the gateway, a fetched page).
+    pub fn latest_known(&self, channel: Id) -> Option<Id> {
+        self.channels.get(&channel).and_then(|c| c.last_message_id)
+    }
+
+    /// A window whose newest message is the channel's newest one *is* the newest page: later
+    /// messages append to it, and the shell has nothing to jump to.
+    pub fn promote_if_latest(&mut self, channel: Id) {
+        let latest = self.latest_known(channel);
+        let Some(h) = self.history.get_mut(&channel) else { return };
+        if let (Some(l), Some(newest)) = (latest, h.messages.back().filter(|m| m.id.0 != 0)) {
+            if newest.id >= l {
+                h.at_latest = true;
+            }
+        }
+    }
+
+    /// Time between the newest loaded message and the channel's newest one, 0 for a window at the
+    /// latest page or when either is unknown (input of `jump_present`).
+    pub fn window_tail_ms(&self, channel: Id) -> u64 {
+        let Some(h) = self.history.get(&channel).filter(|h| !h.at_latest) else { return 0 };
+        let (Some(l), Some(n)) = (self.latest_known(channel), h.messages.back()) else { return 0 };
+        l.timestamp_ms().saturating_sub(n.id.timestamp_ms())
+    }
+
+    /// A page of messages newer than the window's newest (`newest_first`, as REST returns them).
+    /// A short page means the channel's newest message was reached: the window becomes the
+    /// newest page, which the gateway then keeps current.
+    pub fn append_history_newer(&mut self, channel: Id, mut newest_first: Vec<Message>, full_page: bool) {
+        newest_first.sort_by_key(|m| m.id);
+        for m in &newest_first {
+            self.users.insert(m.author.id, m.author.clone());
+            for u in &m.mentions {
+                self.users.entry(u.id).or_insert_with(|| u.clone());
+            }
+        }
+        let h = self.history.entry(channel).or_default();
+        let newest = h.messages.back().map(|m| m.id).unwrap_or(Snowflake(0));
+        for m in newest_first {
+            if m.id > newest && !h.messages.iter().any(|x| x.id == m.id) {
+                h.messages.push_back(m);
+            }
+        }
+        while h.messages.len() > MAX_MESSAGES_PER_CHANNEL {
+            h.messages.pop_front();
+            h.has_more_before = true;
+        }
+        if !full_page {
+            h.at_latest = true;
+        }
+        self.promote_if_latest(channel);
     }
 
     pub fn prepend_history(&mut self, channel: Id, newest_first: Vec<Message>, full_page: bool) {
@@ -1953,7 +2035,46 @@ impl Store {
         if let Some(o) = ow.iter().find(|o| o.kind == 1 && o.id == me) {
             p = (p & !parse(&o.deny)) | parse(&o.allow);
         }
+        if channel.is_thread() {
+            p = thread_permissions(channel, p);
+        }
         p
+    }
+
+    /// Admit a thread the server told us about outside the gateway (`GET /channels/{id}` for a
+    /// thread this account has not joined), as the official client's `THREAD_CREATE` does: it
+    /// sits in the channel store under its parent, without a thread member. Nothing is joined.
+    /// `Err` says why it cannot be shown: not a thread, its server or parent is not loaded, or
+    /// this account may not see it (a private thread it is not in).
+    pub fn admit_fetched_thread(&mut self, mut c: Channel, hint_guild: Option<Id>) -> std::result::Result<(), crate::open_target::Missing> {
+        use crate::open_target::Missing;
+        if !c.is_thread() {
+            return Err(Missing::Unknown);
+        }
+        let Some(guild) = c.guild_id.or(hint_guild) else { return Err(Missing::Unknown) };
+        c.guild_id = Some(guild);
+        let parent = c.parent_id.and_then(|p| self.channels.get(&p));
+        if !self.guilds.contains_key(&guild) || parent.is_none() {
+            return Err(Missing::Unknown);
+        }
+        if let Some(known) = self.channels.get(&c.id) {
+            // Never replace what the gateway told us (it carries our thread member).
+            c.member = known.member.clone();
+        }
+        if !self.can_view(&c) {
+            return Err(Missing::Hidden);
+        }
+        self.upsert_channel(c);
+        Ok(())
+    }
+
+    pub fn thread_join(&self, channel: &Channel) -> ThreadJoin {
+        match (channel.is_thread(), channel.member.is_some(), channel.is_archived()) {
+            (false, ..) => ThreadJoin::NotThread,
+            (_, true, _) => ThreadJoin::Joined,
+            (_, false, true) => ThreadJoin::Archived,
+            (_, false, false) => ThreadJoin::CanJoin,
+        }
     }
 
     pub fn can_view(&self, channel: &Channel) -> bool {
@@ -2059,6 +2180,41 @@ impl Store {
         self.users.get(&user).map(|u| u.display_name().to_string()).unwrap_or_else(|| user.to_string())
     }
 
+    /// People this session knows who answer to `typed`, best first: the name you gave a friend,
+    /// their server nicknames, global name and username all count, fuzzily (prefix, word start,
+    /// typo). One rule for `from:`/`mentions:` resolution and its autocomplete, so a name you can
+    /// see anywhere finds the person everywhere.
+    pub fn users_matching(&self, typed: &str) -> Vec<(Id, i32)> {
+        let q = crate::find::fold(typed.trim_start_matches('@'));
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut best: HashMap<Id, i32> = HashMap::new();
+        let mut note = |id: Id, name: &str| {
+            if let Some(sc) = crate::find::match_score(&q, &crate::find::fold(name)) {
+                let e = best.entry(id).or_insert(i32::MIN);
+                *e = (*e).max(sc);
+            }
+        };
+        for (id, n) in &self.friend_nicks {
+            note(*id, n);
+        }
+        for u in self.users.values().filter(|u| !u.bot) {
+            note(u.id, u.display_name());
+            note(u.id, &u.username);
+        }
+        for ((_, id), m) in &self.members {
+            if let Some(n) = m.nick.as_deref().filter(|n| !crate::model::is_blank_name(n)) {
+                if self.users.get(id).is_some_and(|u| !u.bot) {
+                    note(*id, n);
+                }
+            }
+        }
+        let mut v: Vec<(Id, i32)> = best.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
     /// Highest coloured role colour for a member, like the official name colour.
     pub fn name_color(&self, guild: Option<Id>, user: Id) -> Option<u32> {
         let g = guild?;
@@ -2100,3 +2256,5 @@ fn same_emoji(a: &Emoji, b: &Emoji) -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;

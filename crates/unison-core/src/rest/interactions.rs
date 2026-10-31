@@ -25,6 +25,12 @@ impl Rest {
         Ok(())
     }
 
+    /// `GET /channels/{id}`: one channel by id, no side effects. Used to show a thread this account
+    /// has not joined (the official client's `ThreadLoader.loadThread`, FIDELITY "Unjoined threads").
+    pub async fn channel(&self, channel: Id) -> Result<Channel> {
+        self.get(&format!("/channels/{channel}")).await
+    }
+
     /// Start a thread on a message (`CHANNEL_MESSAGE_THREADS`) or without one (`CHANNEL_THREADS`).
     /// Body as the web composer builds it; capture: its `location` field.
     pub async fn create_thread(

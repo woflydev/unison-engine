@@ -45,7 +45,7 @@ fn ready() -> Value {
     })
 }
 
-fn store() -> Store {
+pub(super) fn store() -> Store {
     let mut s = Store::default();
     let d = s.apply("READY", &term(ready())).unwrap();
     assert!(d.contains(&Delta::Ready));
@@ -689,6 +689,23 @@ fn friend_nickname_replaces_every_name_and_clears() {
     s.apply("RELATIONSHIP_REMOVE", &term(json!({"id": "2", "type": 1}))).unwrap();
     assert_eq!(s.display_name(None, Snowflake(2)), "alice");
     assert!(s.set_friend_nick_local(Snowflake(2), Some("x".into())).is_empty(), "not a friend any more");
+}
+
+#[test]
+fn people_are_found_by_any_name_they_answer_to() {
+    let mut s = Store::default();
+    s.me = Some(User { id: Snowflake(1), ..Default::default() });
+    s.users.insert(Snowflake(2), User { id: Snowflake(2), username: "alice_w".into(), ..Default::default() });
+    s.users.insert(Snowflake(3), User { id: Snowflake(3), username: "bob".into(), ..Default::default() });
+    s.apply("RELATIONSHIP_ADD", &term(json!({"id": "2", "type": 1, "nickname": "Ally", "user": {"id": "2", "username": "alice_w"}}))).unwrap();
+    let first = |q: &str| s.users_matching(q).first().map(|(id, _)| *id);
+    assert_eq!(first("ally"), Some(Snowflake(2)), "friend nickname");
+    assert_eq!(first("alice"), Some(Snowflake(2)), "username prefix");
+    assert_eq!(first("alyl"), Some(Snowflake(2)), "one typo still finds the friend");
+    assert_eq!(first("zzzz"), None);
+    assert_eq!(first("bpb"), None);
+    assert_eq!(first("bob"), Some(Snowflake(3)));
+    assert!(s.users_matching("").is_empty());
 }
 
 #[test]

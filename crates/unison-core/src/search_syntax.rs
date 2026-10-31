@@ -33,6 +33,15 @@ impl Scope {
         }
     }
 
+    /// The scope chips, broadest first (⌘1 is the first): Everywhere, This server, This channel.
+    pub fn tabs(in_guild: bool) -> &'static [Scope] {
+        if in_guild {
+            &[Scope::Everywhere, Scope::Server, Scope::Channel]
+        } else {
+            &[Scope::Everywhere, Scope::Channel]
+        }
+    }
+
     pub fn asks_discord(self) -> bool {
         self != Scope::Everywhere
     }
@@ -153,6 +162,12 @@ mod tests {
         assert_eq!(Scope::options(true)[0], Scope::Server);
         assert_eq!(Scope::options(false), [Scope::Channel, Scope::Everywhere]);
         assert!(!Scope::Everywhere.asks_discord());
+    }
+
+    #[test]
+    fn chips_run_broad_to_narrow() {
+        assert_eq!(Scope::tabs(true), [Scope::Everywhere, Scope::Server, Scope::Channel]);
+        assert_eq!(Scope::tabs(false), [Scope::Everywhere, Scope::Channel]);
     }
 
     #[test]

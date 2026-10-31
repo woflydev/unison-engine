@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
-use crate::cache::{Cache, SearchHit};
+use crate::cache::Cache;
 use crate::fidelity::{AppState, ClientIdentity};
 use crate::forum::{self, ForumQuery};
 use crate::gateway::{self, GatewayConfig, GatewayEvent, GatewayHandle};
@@ -53,6 +53,10 @@ const FOLDER_WRITE_DELAY: Duration = Duration::from_millis(1200);
 pub type Emit = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
 /// Opens closer together than this count as one burst (see `open_channel`).
+/// Messages shown on each side of a jumped-to message (the `?around=` page is 50 long).
+const AROUND_HALF: u32 = 25;
+/// Shown when a jump target no longer exists on the server.
+const MESSAGE_GONE: &str = "that message is gone";
 const OPEN_BURST: Duration = Duration::from_millis(400);
 /// A channel already showing its latest page is not fetched again for this long.
 const REFETCH_MIN: Duration = Duration::from_secs(30);
@@ -71,6 +75,10 @@ pub struct Session {
     last_open: Mutex<Instant>,
     /// Reads already sent or answered (ARCHITECTURE rule 10).
     pub reads: crate::dedupe::Dedupe,
+    /// Channel ids the server refused to show (unjoined-thread previews).
+    previews: crate::open_target::Misses,
+    /// Discord search pages, kept for `SEARCH_FRESH` so the same search is not asked twice.
+    pub search_pages: Mutex<crate::find::PageCache<Value>>,
     profiles: Mutex<std::collections::HashMap<(Id, Option<Id>), (Instant, serde_json::Value)>>,
     pub nav: Mutex<crate::navstate::NavState>,
     /// Generation of the newest rail edit; only the newest one's delayed write is sent.
@@ -130,7 +138,9 @@ impl Session {
             power_tx,
             selected: Mutex::new(None),
             last_open: Mutex::new(Instant::now() - OPEN_BURST),
+            previews: Default::default(),
             reads: Default::default(),
+            search_pages: Default::default(),
             profiles: Default::default(),
             folder_gen: std::sync::atomic::AtomicU64::new(0),
             nav: Mutex::new(nav_cache.get("nav").ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
@@ -358,7 +368,9 @@ impl Session {
     /// for channels that have a member list (forums don't).
     fn subscribe(&self, guild: Option<Id>, channel: Id) {
         let Some(g) = guild else { return };
-        let with_members = self.store.read().channels.get(&channel).is_some_and(|c| !c.is_forum_like());
+        // Forums subscribe the guild only; so does a thread being previewed without joining (the
+        // official client sends a channel range for neither, FIDELITY "Unjoined threads").
+        let with_members = self.store.read().channels.get(&channel).is_some_and(|c| !c.is_forum_like() && !(c.is_thread() && c.member.is_none()));
         let payloads = {
             let mut subs = self.subs.lock();
             subs.guild(g);
@@ -391,7 +403,15 @@ impl Session {
         }
     }
 
-    pub async fn open_channel(self: &Arc<Self>, guild: Option<Id>, channel: Id, intent: Option<UserIntent>) -> Result<()> {
+    /// Select `channel`: remember it, trim the one left, show the cached page, subscribe. Returns
+    /// whether the latest page was already loaded. Shared by every way of opening a channel.
+    fn begin_open(&self, guild: Option<Id>, channel: Id) -> bool {
+        self.begin_open_with(guild, channel, true)
+    }
+
+    /// `show_latest_cache` false keeps whatever window the channel holds (a jump to a message
+    /// must not swap a window that already has it for the cached newest page first).
+    fn begin_open_with(&self, guild: Option<Id>, channel: Id, show_latest_cache: bool) -> bool {
         if let Some((_, prev)) = self.selected.lock().replace((guild, channel)) {
             if prev != channel {
                 self.store.write().trim_history(prev, 50);
@@ -400,7 +420,7 @@ impl Session {
         self.rest.set_location(guild, Some(channel));
         self.identity.touch();
         let has_history = self.store.read().history.get(&channel).is_some_and(|h| h.at_latest);
-        if !has_history {
+        if !has_history && show_latest_cache {
             if let Ok(cached) = self.cache.load_messages(channel, 50) {
                 if !cached.is_empty() {
                     self.store.write().set_history_latest(channel, cached, true);
@@ -409,6 +429,52 @@ impl Session {
             }
         }
         self.subscribe(guild, channel);
+        has_history
+    }
+
+    /// Open `channel` around `message` (a jump from the Inbox, search, a link, a notification).
+    /// Selecting and loading are one step, so the latest page can never arrive after the window
+    /// around the message and replace it. A message already in the loaded window needs no request.
+    /// If the window cannot be loaded the channel opens at its latest page instead.
+    pub async fn open_channel_at(self: &Arc<Self>, guild: Option<Id>, channel: Id, message: Id, intent: Option<UserIntent>) -> Result<()> {
+        self.begin_open_with(guild, channel, false);
+        if crate::open_target::message_loaded(&self.store.read(), channel, message) {
+            (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+            return Ok(());
+        }
+        // A message we have stored before paints at once from the cache (also offline); the
+        // network window replaces it a moment later, keeping the reader's place.
+        let cached = self.cache.load_around(channel, message, AROUND_HALF).unwrap_or_default();
+        let from_cache = !cached.is_empty();
+        if from_cache {
+            self.store.write().set_history_window(channel, cached);
+            (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+        }
+        // The same window is never asked for twice at once (a double click, a second reply line).
+        let key = format!("around:{channel}:{message}");
+        if !self.reads.begin(&key, Duration::ZERO) {
+            return Ok(());
+        }
+        let page = match self.rest.messages_around(channel, message).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.reads.finish(&key, false);
+                if from_cache {
+                    return Ok(());
+                }
+                let _ = self.open_channel(guild, channel, intent).await;
+                return Err(e);
+            }
+        };
+        self.reads.finish(&key, true);
+        let found = page.iter().any(|m| m.id == message);
+        self.store.write().set_history_window(channel, page);
+        (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+        if found { Ok(()) } else { Err(Error::Other(MESSAGE_GONE.into())) }
+    }
+
+    pub async fn open_channel(self: &Arc<Self>, guild: Option<Id>, channel: Id, intent: Option<UserIntent>) -> Result<()> {
+        let has_history = self.begin_open(guild, channel);
         // A person can't read channels faster than a few per second; a script or a held arrow key can.
         // The first open after a pause fetches at once; an open that follows another within
         // `OPEN_BURST` waits it out and fetches only if it is still the channel on screen. The
@@ -458,6 +524,57 @@ impl Session {
             self.rest.ack(intent, channel, last).await?;
         }
         Ok(())
+    }
+
+    /// Make a thread this account has not joined viewable, the way the official client does when a
+    /// link, mention or search hit points at it: if the channel is not known, `GET /channels/{id}`
+    /// once and admit it to the store under its parent (no join, no write, nothing acked). Needs a
+    /// real gesture (`intent` is only checked for presence: it is a read, so it is not redeemed);
+    /// without one nothing is requested. `Ok(None)` means a request for it is already in flight.
+    /// Answers are remembered for `MISS_TTL`, so a dead link asks the server once.
+    pub async fn preview_thread(self: &Arc<Self>, channel: Id, hint_guild: Option<Id>, intent: Option<&UserIntent>) -> Result<Option<crate::open_target::Resolution>> {
+        use crate::open_target::{Missing, Resolution, resolve};
+        let known = |s: &Self| resolve(&s.store.read(), channel, hint_guild);
+        let r = known(self);
+        if intent.is_none() || !matches!(r, Resolution::Fallback { why: Missing::Unknown, .. }) {
+            return Ok(Some(r));
+        }
+        let fallback = |why| Resolution::Fallback { guild: hint_guild.filter(|g| self.store.read().guilds.contains_key(g)), why };
+        if let Some(why) = self.previews.get(channel, crate::open_target::MISS_TTL) {
+            return Ok(Some(fallback(why)));
+        }
+        let key = format!("thread:{channel}");
+        if !self.reads.begin(&key, Duration::ZERO) {
+            return Ok(None);
+        }
+        let fetched = self.rest.channel(channel).await;
+        let out = match fetched {
+            Ok(c) => {
+                let guild = c.guild_id.or(hint_guild);
+                let admitted = self.store.write().admit_fetched_thread(c, hint_guild);
+                match admitted {
+                    Ok(()) => {
+                        (self.emit)(SessionEvent::Deltas(vec![Delta::ChannelsChanged { guild }]));
+                        Ok(known(self))
+                    }
+                    Err(why) => {
+                        self.previews.record(channel, why);
+                        Ok(fallback(why))
+                    }
+                }
+            }
+            Err(Error::Http { status: 404, .. }) => {
+                self.previews.record(channel, Missing::Unknown);
+                Ok(fallback(Missing::Unknown))
+            }
+            Err(Error::Http { status: 403, .. }) => {
+                self.previews.record(channel, Missing::Hidden);
+                Ok(fallback(Missing::Hidden))
+            }
+            Err(e) => Err(e),
+        };
+        self.reads.finish(&key, false);
+        out.map(Some)
     }
 
     // ----- Forums -----
@@ -842,6 +959,33 @@ impl Session {
             emit(SessionEvent::Deltas(vec![Delta::Voice]));
         });
         v.handle = Some(voice::spawn(params, self.rest.transport.clone(), self.identity.clone(), on_event));
+    }
+
+    /// Grow a detached window (opened around a message) towards the present by one page. A short
+    /// page reaches the newest message and the window becomes the newest page. Returns whether
+    /// more may follow.
+    pub async fn load_newer(&self, channel: Id) -> Result<bool> {
+        let newest = {
+            let s = self.store.read();
+            s.history.get(&channel).filter(|h| !h.at_latest).and_then(|h| h.messages.iter().rev().find(|m| m.id.0 != 0).map(|m| m.id))
+        };
+        let Some(after) = newest else { return Ok(false) };
+        let key = format!("newer:{channel}");
+        if !self.reads.begin(&key, Duration::ZERO) {
+            return Ok(true);
+        }
+        let page = match self.rest.messages_after(channel, after, 50).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.reads.finish(&key, false);
+                return Err(e);
+            }
+        };
+        self.reads.finish(&key, true);
+        let full = page.len() == 50;
+        self.store.write().append_history_newer(channel, page, full);
+        (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+        Ok(full)
     }
 
     pub async fn load_older(&self, channel: Id) -> Result<bool> {
@@ -1273,33 +1417,9 @@ impl Session {
         Ok(())
     }
 
-    pub fn search_local(&self, query: &str) -> Vec<SearchHit> {
-        self.cache.search(query, 50).unwrap_or_default()
-    }
-
-    /// Local hits limited to a scope: one channel, every channel of a server, or everything.
-    pub fn search_local_scoped(&self, scope: crate::search_syntax::Scope, guild: Option<Id>, channel: Id, query: &str) -> Vec<SearchHit> {
-        use crate::search_syntax::Scope;
-        if scope == Scope::Everywhere {
-            return self.search_local(query);
-        }
-        // Narrow scopes filter a wider page, so a busy elsewhere doesn't crowd them out.
-        let hits = self.cache.search(query, 500).unwrap_or_default();
-        let st = self.store.read();
-        hits.into_iter()
-            .filter(|h| match scope {
-                Scope::Channel => h.channel == channel,
-                _ => st.channels.get(&h.channel).is_some_and(|c| c.guild_id == guild),
-            })
-            .take(50)
-            .collect()
-    }
-
-    pub async fn search_remote(&self, guild: Option<Id>, channel: Id, query: &str) -> Result<Value> {
-        match guild {
-            Some(g) => self.rest.search_guild(g, query).await,
-            None => self.rest.search_channel(channel, query).await,
-        }
+    /// One page of the on-device text index (`Cache::search_page`).
+    pub fn search_local_page(&self, q: &crate::cache::LocalQuery) -> crate::cache::LocalPage {
+        self.cache.search_page(q).unwrap_or_default()
     }
 
     /// Set the user's status the way the official client does: presence over the gateway (op 3),
