@@ -29,6 +29,7 @@ fn to_ffi(r: RecentReaction) -> RecentEmoji {
 pub enum WelcomeStep {
     Hello,
     Search,
+    IndexSize,
     Appearance,
     Privacy,
     Features,
@@ -44,6 +45,7 @@ pub fn welcome_steps(from: u32) -> Vec<WelcomeStep> {
         .map(|s| match s {
             S::Hello => WelcomeStep::Hello,
             S::Search => WelcomeStep::Search,
+            S::IndexSize => WelcomeStep::IndexSize,
             S::Appearance => WelcomeStep::Appearance,
             S::Privacy => WelcomeStep::Privacy,
             S::Features => WelcomeStep::Features,

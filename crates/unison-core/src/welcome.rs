@@ -10,7 +10,7 @@
 use std::path::Path;
 
 /// Bump when a step is added (give it `since: REVISION`).
-pub const REVISION: u32 = 1;
+pub const REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
@@ -48,6 +48,8 @@ pub fn used_before(data_dir: &Path) -> bool {
 pub enum Step {
     Hello,
     Search,
+    /// How much space the on-device search index may take (the same setting as Settings, Search).
+    IndexSize,
     Appearance,
     /// What Unison holds back from Discord, with a switch for each.
     Privacy,
@@ -60,7 +62,10 @@ pub enum Step {
 impl Step {
     /// The revision that introduced the step.
     fn since(self) -> u32 {
-        1
+        match self {
+            Step::IndexSize => 2,
+            _ => 1,
+        }
     }
 }
 
@@ -68,7 +73,7 @@ impl Step {
 /// the closing screen. (Notifications are not a step: the system is asked after sign-in, when a
 /// message can actually arrive.)
 pub fn steps(from: u32) -> Vec<Step> {
-    let mut all = vec![Step::Hello, Step::Search, Step::Appearance, Step::Privacy, Step::Features];
+    let mut all = vec![Step::Hello, Step::Search, Step::IndexSize, Step::Appearance, Step::Privacy, Step::Features];
     all.retain(|s| s.since() > from);
     all.push(Step::Finish);
     all
@@ -93,8 +98,15 @@ mod tests {
 
     #[test]
     fn a_revision_without_new_steps_shows_nothing() {
-        // With REVISION 1 every step has since 1, so from 1 only the closing screen is left.
+        // Nothing is newer than the current revision, so only the closing screen is left.
         assert_eq!(steps(REVISION), vec![Step::Finish]);
+    }
+
+    #[test]
+    fn someone_who_saw_revision_one_is_shown_only_the_index_size_step() {
+        assert_eq!(steps(1), vec![Step::IndexSize, Step::Finish]);
+        assert_eq!(plan(1, false, true, true), Plan::Show { from: 1 });
+        assert_eq!(&steps(0)[..3], &[Step::Hello, Step::Search, Step::IndexSize]);
     }
 
     #[test]
