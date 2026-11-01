@@ -109,6 +109,8 @@ fn jumbo() {
     assert!(render("<:a:1> <:b:2>").jumbo_emoji);
     assert!(render("😀😀").jumbo_emoji);
     assert!(!render("hi 😀").jumbo_emoji);
+    assert!(render("👨‍👩‍👧 😀").jumbo_emoji, "a joined family counts per emoji, not per joiner");
+    assert!(!render(&"😀".repeat(31)).jumbo_emoji, "past 30 it is a wall of emoji, not a few");
 }
 
 #[test]

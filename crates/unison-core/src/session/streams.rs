@@ -120,6 +120,15 @@ impl Session {
         Ok(())
     }
 
+    /// Ask for a fresh keyframe of `user`'s video on `stream` (`call` for cameras, else a stream key).
+    pub fn request_video_keyframe(&self, stream: &str, user: Id) {
+        let v = self.voice.lock();
+        let handle = if stream == "call" { v.handle.as_ref() } else { v.streams.get(stream).and_then(|s| s.handle.as_ref()) };
+        if let Some(h) = handle {
+            h.request_keyframe(user.0);
+        }
+    }
+
     /// The stream connection for `key`, to feed it frames or change what it wants.
     pub fn with_stream<R>(&self, key: &str, f: impl FnOnce(&VoiceHandle) -> R) -> Option<R> {
         self.voice.lock().streams.get(key).and_then(|s| s.handle.as_ref()).map(f)
@@ -140,6 +149,7 @@ impl Session {
         intent.redeem()?;
         let (guild, channel, mute, deaf) = {
             let v = self.voice.lock();
+            tracing::debug!(target: "unison_core::voice", on, call_connection = v.handle.is_some(), in_channel = v.channel.is_some(), "camera toggled");
             if let Some(h) = &v.handle {
                 if on { h.start_video(want) } else { h.stop_video() }
             }

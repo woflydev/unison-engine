@@ -67,6 +67,10 @@ pub struct ChannelItem {
     pub muted: bool,
     pub nsfw: bool,
     pub can_send: bool,
+    /// The user may start a poll here (Send Polls in a server, always in a DM).
+    pub can_poll: bool,
+    /// The user may send a voice message here (Send Voice Messages in a server, always in a DM).
+    pub can_voice_note: bool,
     /// The user may create invites to this channel.
     pub can_invite: bool,
     /// The user may drag this channel to another place in the list (Manage Channels, a server channel).
@@ -118,11 +122,13 @@ pub(crate) fn channel_item(s: &Store, c: &Channel) -> ChannelItem {
             .as_deref()
             .filter(|t| !t.is_empty())
             .map(|t| rich(s, c.guild_id, t).text),
-        unread: c.is_text_like() && s.is_unread(c) && !s.is_channel_muted(c),
+        unread: c.has_text_chat() && s.is_unread(c) && !s.is_channel_muted(c),
         mentions: s.mention_count(c.id),
         muted: s.is_channel_muted(c),
         nsfw: c.nsfw,
         can_send: perms & unison_core::store::perm::SEND_MESSAGES != 0,
+        can_poll: unison_core::poll_create::can_create(c.guild_id.is_some(), perms),
+        can_voice_note: unison_core::voice_note::can_record(c.guild_id.is_some(), perms),
         can_invite: perms & unison_core::store::perm::CREATE_INSTANT_INVITE != 0,
         can_move: c.guild_id.is_some() && !c.is_thread() && perms & unison_core::store::perm::MANAGE_CHANNELS != 0,
         join: match s.thread_join(c) {

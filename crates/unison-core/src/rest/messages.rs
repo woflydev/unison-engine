@@ -19,6 +19,14 @@ pub struct ForwardSource {
     pub message_id: Id,
 }
 
+/// What makes an attachment a voice message: its length and the waveform the player draws.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceMeta {
+    pub duration_secs: f64,
+    /// Base64, one byte per sample.
+    pub waveform: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalFile {
     pub filename: String,
@@ -28,6 +36,7 @@ pub struct LocalFile {
     /// Alt text.
     pub description: Option<String>,
     pub spoiler: bool,
+    pub voice: Option<VoiceMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +45,7 @@ pub struct UploadedAttachment {
     pub uploaded_filename: String,
     pub description: Option<String>,
     pub spoiler: bool,
+    pub voice: Option<VoiceMeta>,
 }
 
 /// `POST /channels/{id}/messages` body, key for key what `MessageQueue.handleSend` posts:
@@ -63,7 +73,8 @@ fn message_body(channel: Id, draft: &OutgoingMessage) -> Value {
                 json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
         }
     }
-    body["flags"] = (if draft.silent { 1 << 12 } else { 0 }).into();
+    let voice = draft.attachments.iter().any(|a| a.voice.is_some());
+    body["flags"] = ((if draft.silent { 1 << 12 } else { 0 }) | if voice { crate::voice_note::FLAG } else { 0 }).into();
     if !draft.attachments.is_empty() {
         body["attachments"] = Value::Array(
             draft
@@ -92,6 +103,10 @@ pub(crate) fn attachment_json(i: usize, a: &UploadedAttachment) -> Value {
     v.insert("uploaded_filename".into(), a.uploaded_filename.clone().into());
     if a.spoiler {
         v.insert("is_spoiler".into(), true.into());
+    }
+    if let Some(voice) = &a.voice {
+        v.insert("duration_secs".into(), voice.duration_secs.into());
+        v.insert("waveform".into(), voice.waveform.clone().into());
     }
     Value::Object(v)
 }
@@ -323,6 +338,7 @@ impl Rest {
             out.push(UploadedAttachment {
                 description: file.description,
                 spoiler: file.spoiler,
+                voice: file.voice,
                 filename: file.filename,
                 uploaded_filename: slot["upload_filename"]
                     .as_str()
@@ -385,7 +401,7 @@ mod tests {
 
     #[test]
     fn attachment_entry_matches_web_client() {
-        let with = UploadedAttachment { filename: "a.png".into(), uploaded_filename: "u/a.png".into(), description: Some("  a cat ".into()), spoiler: true };
+        let with = UploadedAttachment { filename: "a.png".into(), uploaded_filename: "u/a.png".into(), description: Some("  a cat ".into()), spoiler: true, voice: None };
         assert_eq!(
             serde_json::to_string(&attachment_json(0, &with)).unwrap(),
             r#"{"id":"0","description":"a cat","filename":"a.png","uploaded_filename":"u/a.png","is_spoiler":true}"#

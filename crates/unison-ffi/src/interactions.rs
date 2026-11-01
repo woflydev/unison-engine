@@ -24,6 +24,66 @@ pub struct PollItem {
     pub total: u32,
 }
 
+/// One answer row of the poll form: text plus an optional emoji (`emoji_id` for a custom one).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PollAnswerDraft {
+    pub text: String,
+    pub emoji_name: Option<String>,
+    pub emoji_id: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PollDurationItem {
+    pub hours: u32,
+    pub label: String,
+}
+
+/// The poll form's limits, so the shell never carries a number of its own.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PollRules {
+    pub max_question: u32,
+    pub max_answer: u32,
+    pub min_answers: u32,
+    pub max_answers: u32,
+    pub default_hours: u32,
+    pub durations: Vec<PollDurationItem>,
+}
+
+fn poll_draft(question: String, answers: Vec<PollAnswerDraft>, hours: u32, multiselect: bool) -> unison_core::poll_create::PollDraft {
+    use unison_core::poll_create::{AnswerDraft, AnswerEmoji, PollDraft};
+    PollDraft {
+        question,
+        answers: answers
+            .into_iter()
+            .map(|a| AnswerDraft {
+                text: a.text,
+                emoji: a.emoji_name.map(|name| AnswerEmoji { id: a.emoji_id, name }),
+            })
+            .collect(),
+        hours,
+        multiselect,
+    }
+}
+
+#[uniffi::export]
+pub fn poll_rules() -> PollRules {
+    use unison_core::poll_create as p;
+    PollRules {
+        max_question: p::MAX_QUESTION as u32,
+        max_answer: p::MAX_ANSWER as u32,
+        min_answers: p::MIN_ANSWERS as u32,
+        max_answers: p::MAX_ANSWERS as u32,
+        default_hours: p::DEFAULT_HOURS,
+        durations: p::DURATIONS.iter().map(|(h, l)| PollDurationItem { hours: *h, label: (*l).into() }).collect(),
+    }
+}
+
+/// Why the form cannot be sent yet (one plain sentence), or nothing when it can.
+#[uniffi::export]
+pub fn poll_refusal(question: String, answers: Vec<PollAnswerDraft>, hours: u32, multiselect: bool) -> Option<String> {
+    unison_core::poll_create::refusal(&poll_draft(question, answers, hours, multiselect))
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Hash)]
 pub struct ComponentButton {
     pub style: u8,
@@ -246,6 +306,21 @@ impl UnisonEngine {
         self.spawn_write(account_id, gesture, move |s, i| async move {
             s.component_interact(i, id(&channel_id), id(&message_id), component_type, custom_id, values).await
         });
+    }
+
+    /// Post a poll (the composer's + menu). The core re-checks the form and refuses with a sentence.
+    pub fn create_poll(
+        &self,
+        account_id: String,
+        channel_id: String,
+        question: String,
+        answers: Vec<PollAnswerDraft>,
+        hours: u32,
+        multiselect: bool,
+        gesture: UserGesture,
+    ) {
+        let draft = poll_draft(question, answers, hours, multiselect);
+        self.spawn_write(account_id, gesture, move |s, i| async move { s.send_poll(i, id(&channel_id), &draft).await });
     }
 
     /// Click a poll answer: votes, changes or clears the vote as the web client does.

@@ -64,6 +64,15 @@ pub struct UserPrefs {
     pub status: Option<String>,
     pub show_current_game: Option<bool>,
     pub locale: Option<String>,
+    pub view_nsfw_guilds: Option<bool>,
+    pub view_nsfw_commands: Option<bool>,
+    pub afk_timeout: Option<u32>,
+    pub stream_notifications_enabled: Option<bool>,
+    pub allow_activity_party_friends: Option<bool>,
+    pub allow_activity_party_voice: Option<bool>,
+    pub inappropriate_conversation_warnings: Option<bool>,
+    pub recent_games_enabled: Option<bool>,
+    pub show_local_time: Option<bool>,
     /// Custom status (read: set when one is active; write: set text to change it).
     pub custom_status_text: Option<String>,
     pub custom_status_emoji: Option<String>,
@@ -101,6 +110,15 @@ impl UserPrefs {
             status: p.status.clone(),
             show_current_game: p.show_current_game,
             locale: p.locale.clone(),
+            view_nsfw_guilds: p.view_nsfw_guilds,
+            view_nsfw_commands: p.view_nsfw_commands,
+            afk_timeout: p.afk_timeout,
+            stream_notifications_enabled: p.stream_notifications_enabled,
+            allow_activity_party_friends: p.allow_activity_party_friends,
+            allow_activity_party_voice: p.allow_activity_party_voice,
+            inappropriate_conversation_warnings: p.inappropriate_conversation_warnings,
+            recent_games_enabled: p.recent_games_enabled,
+            show_local_time: p.show_local_time,
             custom_status_text: cs.map(|c| c.text.clone()),
             custom_status_emoji: cs.map(|c| c.emoji_name.clone()).filter(|e| !e.is_empty()),
             custom_status_expires_ms: cs.map(|c| c.expires_at_ms).filter(|e| *e != 0),
@@ -152,6 +170,15 @@ impl UserPrefs {
             show_current_game: self.show_current_game,
             status_created_at_ms,
             locale: self.locale.clone(),
+            view_nsfw_guilds: self.view_nsfw_guilds,
+            view_nsfw_commands: self.view_nsfw_commands,
+            afk_timeout: self.afk_timeout,
+            stream_notifications_enabled: self.stream_notifications_enabled,
+            allow_activity_party_friends: self.allow_activity_party_friends,
+            allow_activity_party_voice: self.allow_activity_party_voice,
+            inappropriate_conversation_warnings: self.inappropriate_conversation_warnings,
+            recent_games_enabled: self.recent_games_enabled,
+            show_local_time: self.show_local_time,
         }
     }
 }
@@ -185,6 +212,33 @@ pub struct GuildNotifItem {
     /// 0 all messages, 1 only @mentions, 2 nothing, 3 server default.
     pub level: u8,
     pub muted: bool,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ChannelOverrideItem {
+    pub channel_id: String,
+    pub name: String,
+    pub muted: bool,
+    /// 0 all messages, 1 only mentions, 2 nothing, 3 use the category or server default.
+    pub level: u8,
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct KeybindItem {
+    pub id: String,
+    pub group: String,
+    pub title: String,
+    /// Platform-neutral tokens joined with `+` (`mod+shift+i`).
+    pub keys: String,
+}
+
+/// Every shortcut the app ships, in display order.
+#[uniffi::export]
+pub fn keybind_table() -> Vec<KeybindItem> {
+    unison_core::keybinds::TABLE
+        .iter()
+        .map(|b| KeybindItem { id: b.id.into(), group: b.group.into(), title: b.title.into(), keys: b.keys.into() })
+        .collect()
 }
 
 fn now_ms() -> u64 {
@@ -353,6 +407,32 @@ impl UnisonEngine {
         self.spawn_write(account_id, gesture, move |s, i| async move {
             s.update_profile(i, serde_json::Value::Object(body)).await
         });
+    }
+
+    /// Channels in a server that have their own mute or level, for the Notifications pane.
+    pub fn channel_notification_overrides(&self, account_id: String, guild_id: String) -> Vec<ChannelOverrideItem> {
+        let g = id(&guild_id);
+        self.with_store(&account_id, |s| {
+            let mut v: Vec<ChannelOverrideItem> = s
+                .guild_settings
+                .get(&g)
+                .into_iter()
+                .flat_map(|x| x.channel_overrides.iter())
+                .filter(|o| o.muted || o.message_notifications != 3)
+                .filter_map(|o| {
+                    let c = s.channels.get(&o.channel_id)?;
+                    Some(ChannelOverrideItem {
+                        channel_id: o.channel_id.to_string(),
+                        name: c.name.clone().unwrap_or_default(),
+                        muted: o.muted,
+                        level: o.message_notifications.min(3),
+                    })
+                })
+                .collect();
+            v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            v
+        })
+        .unwrap_or_default()
     }
 
     pub fn guild_notification_levels(&self, account_id: String) -> Vec<GuildNotifItem> {

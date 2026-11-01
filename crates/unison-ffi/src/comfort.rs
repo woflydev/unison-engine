@@ -12,8 +12,10 @@ pub struct ComfortItem {
     pub strip_location: bool,
     /// Trim an overlong message (the same three-way choice as compression).
     pub trim_choice: crate::uploads::CompressChoice,
-    /// Comma-separated, as the settings field shows them.
+    /// Comma-separated. Read-only: the list is edited with `add_keywords` / `remove_keyword`.
     pub keywords: String,
+    /// The notification words, in the order they were added (one chip each).
+    pub keyword_list: Vec<String>,
     pub quiet_enabled: bool,
     /// Minutes after local midnight.
     pub quiet_start: u16,
@@ -75,9 +77,26 @@ fn to_item(c: &Comfort) -> ComfortItem {
             Some(false) => crate::uploads::CompressChoice::Off,
         },
         keywords: c.keywords.join(", "),
+        keyword_list: c.keywords.clone(),
         quiet_enabled: c.quiet.is_some(),
         quiet_start: q.start,
         quiet_end: q.end,
+    }
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct KeywordsResult {
+    pub list: Vec<String>,
+    pub note: Option<String>,
+}
+
+impl UnisonEngine {
+    /// Persist the list and apply it to every open account at once (no restart).
+    fn save_keywords(&self, c: &Comfort) {
+        self.inner.local.set_comfort(c);
+        for s in self.inner.sessions_snapshot() {
+            s.store.write().notify_keywords = c.keywords.clone();
+        }
     }
 }
 
@@ -87,7 +106,25 @@ impl UnisonEngine {
         to_item(&self.inner.local.comfort())
     }
 
+    /// Add the words in `text` to the notification list (several at once when pasted). `note` is the
+    /// one plain line to show when nothing was added.
+    pub fn add_keywords(&self, text: String) -> KeywordsResult {
+        let mut c = self.inner.local.comfort();
+        let r = comfort::add_keywords(&mut c.keywords, &text);
+        self.save_keywords(&c);
+        KeywordsResult { list: c.keywords, note: comfort::keyword_note(r).map(str::to_string) }
+    }
+
+    pub fn remove_keyword(&self, word: String) -> Vec<String> {
+        let mut c = self.inner.local.comfort();
+        comfort::remove_keyword(&mut c.keywords, &word);
+        self.save_keywords(&c);
+        c.keywords
+    }
+
     pub fn set_comfort(&self, item: ComfortItem) {
+        // The keyword list is edited only through add/remove, so a stale item never overwrites it.
+        let keywords = self.inner.local.comfort().keywords;
         let c = Comfort {
             clean_links: item.clean_links,
             confirm_everyone: item.confirm_everyone,
@@ -97,7 +134,7 @@ impl UnisonEngine {
                 crate::uploads::CompressChoice::On => Some(true),
                 crate::uploads::CompressChoice::Off => Some(false),
             },
-            keywords: comfort::normalize_keywords(&item.keywords),
+            keywords,
             quiet: item.quiet_enabled.then_some(QuietHours { start: item.quiet_start.min(1439), end: item.quiet_end.min(1439) }),
         };
         self.inner.local.set_comfort(&c);

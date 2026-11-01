@@ -28,7 +28,7 @@ impl Encoder {
         unsafe {
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_BITRATE_REQUEST, bitrate);
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32);
-            ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 0i32);
+            ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 30i32); // transport option `packetLossRate: .3`, `fec: true` (web bundle getConnectionTransportOptions)
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_SIGNAL_REQUEST, ffi::OPUS_SIGNAL_VOICE);
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_COMPLEXITY_REQUEST, 10i32);
         }

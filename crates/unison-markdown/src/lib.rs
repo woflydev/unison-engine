@@ -296,8 +296,11 @@ fn is_jumbo(nodes: &[Node]) -> bool {
                     if !is_emoji_char(ch) {
                         return false;
                     }
+                    // Joiners and variation selectors belong to the emoji before them.
+                    if !matches!(ch as u32, 0xFE0F | 0x200D | 0x20E3 | 0xE0020..=0xE007F) {
+                        count += 1;
+                    }
                 }
-                count += 1;
             }
             _ => return false,
         }

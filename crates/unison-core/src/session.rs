@@ -61,7 +61,13 @@ const OPEN_BURST: Duration = Duration::from_millis(400);
 /// A channel already showing its latest page is not fetched again for this long.
 const REFETCH_MIN: Duration = Duration::from_secs(30);
 
+/// How long alone in a 1:1 DM call before leaving, as the official client (`CallIdleManager`).
+pub const CALL_IDLE_LEAVE: Duration = Duration::from_secs(180);
+
 pub struct Session {
+    /// The idle-leave timer: `idle_armed` while one runs, `idle_gen` bumped to cancel it.
+    idle_gen: std::sync::atomic::AtomicU64,
+    idle_armed: std::sync::atomic::AtomicBool,
     pub user_id: Id,
     pub rest: Arc<Rest>,
     pub store: Arc<RwLock<Store>>,
@@ -148,6 +154,8 @@ impl Session {
             activity: tokio::sync::Notify::new(),
             subs: Mutex::new(Subscriptions::default()),
             voice: Mutex::new(VoiceCtl::default()),
+            idle_gen: Default::default(),
+            idle_armed: Default::default(),
             cancels: Mutex::new(std::collections::HashMap::new()),
             retained: Mutex::new(std::collections::HashMap::new()),
         }))
@@ -272,6 +280,9 @@ impl Session {
                             };
                             if name == "READY" || name == "USER_SETTINGS_PROTO_UPDATE" {
                                 self.sync_locale();
+                            }
+                            if matches!(name.as_str(), "VOICE_STATE_UPDATE" | "CALL_CREATE" | "CALL_DELETE") {
+                                self.watch_call_idle();
                             }
                             self.note_dirty(&deltas);
                             self.activity.notify_one();
@@ -763,6 +774,46 @@ impl Session {
 
     pub fn leave_voice(&self, intent: UserIntent) -> Result<()> {
         intent.redeem()?;
+        self.hang_up();
+        Ok(())
+    }
+
+    /// Starts the idle-leave timer when we are alone in a 1:1 DM call, cancels it when we are not.
+    /// An armed timer is not restarted by later updates (our own mute toggles must not postpone it).
+    /// On expiry it leaves the way the official client does and says so.
+    fn watch_call_idle(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.store.read().alone_in_dm_call() {
+            self.idle_gen.fetch_add(1, SeqCst);
+            self.idle_armed.store(false, SeqCst);
+            return;
+        }
+        if self.idle_armed.swap(true, SeqCst) {
+            return;
+        }
+        let (me, armed_gen) = (self.clone(), self.idle_gen.load(SeqCst));
+        tokio::spawn(async move {
+            tokio::time::sleep(CALL_IDLE_LEAVE).await;
+            if me.idle_gen.load(SeqCst) != armed_gen {
+                return;
+            }
+            me.idle_armed.store(false, SeqCst);
+            if me.store.read().alone_in_dm_call() {
+                tracing::debug!(target: "unison_core::voice", "alone in a DM call for 3 minutes: leaving");
+                me.hang_up();
+                (me.emit)(SessionEvent::Error("You were alone in the call for 3 minutes, so Unison left it.".into()));
+            }
+        });
+    }
+
+    /// Whether this account is in a call (or joining one).
+    pub fn in_call(&self) -> bool {
+        self.voice.lock().channel.is_some()
+    }
+
+    /// Leave the call. Only behind a gesture: `leave_voice`, or the engine's one-call rule when the
+    /// person joins a call on another account (`Engine::leave_other_calls`).
+    pub(crate) fn hang_up(&self) {
         let guild = {
             let mut v = self.voice.lock();
             if let Some(h) = v.handle.take() {
@@ -784,7 +835,6 @@ impl Session {
         s.voice = crate::store::VoiceCall { self_mute: m, self_deaf: d, ..Default::default() };
         drop(s);
         (self.emit)(SessionEvent::Deltas(vec![Delta::Voice]));
-        Ok(())
     }
 
     /// Mute or deafen. In a call this updates op 4 like the official client; otherwise it's
@@ -1069,7 +1119,10 @@ impl Session {
             }
             crate::send_rules::check_final(&named, premium, tier).map_err(Error::Refused)?;
             self.store.write().push_pending(channel, content.clone(), nonce);
-            (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+            // An insert, not a reset: the local echo (id 0) arrives in the transcript like any new
+            // message (fade and glide, UI.md 2b.12) instead of a full reload. Not persisted: only
+            // gateway dispatches mark history dirty.
+            (self.emit)(SessionEvent::Deltas(vec![Delta::MessageInserted { channel, message: Snowflake(0) }]));
             let (upload_intent, intent) = intent.split();
             let attachments = if files.is_empty() {
                 vec![]
@@ -2143,7 +2196,7 @@ mod send_tests {
     }
 
     fn file(name: &str, bytes: usize) -> LocalFile {
-        LocalFile { filename: name.into(), content_type: "application/zip".into(), bytes: bytes::Bytes::from(vec![0; bytes]), description: None, spoiler: false }
+        LocalFile { filename: name.into(), content_type: "application/zip".into(), bytes: bytes::Bytes::from(vec![0; bytes]), description: None, spoiler: false, voice: None }
     }
 
     #[tokio::test]

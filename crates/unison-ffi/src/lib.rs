@@ -38,6 +38,7 @@ mod actions;
 mod audio;
 mod channels;
 mod comfort;
+mod mic;
 mod composer;
 mod dms;
 mod find;
@@ -60,7 +61,9 @@ mod sends;
 mod uploads;
 mod slash;
 mod stage;
+mod cosmetics;
 mod settings;
+mod shell_prefs;
 mod setup;
 mod shell_nav;
 mod types;
@@ -116,7 +119,8 @@ pub trait EventListener: Send + Sync {
     /// A command produced a place to go (e.g. a DM was opened from the friends list).
     fn on_navigate(&self, account: String, guild_id: Option<String>, channel_id: String);
     /// A remote video access unit (Annex B H.264). `stream` is `call` for camera video or a stream key.
-    fn on_remote_video(&self, account: String, stream: String, user_id: String, data: Vec<u8>, keyframe: bool, pts: u32);
+    /// `rotation`: clockwise degrees (0, 90, 180, 270) to turn the picture for display.
+    fn on_remote_video(&self, account: String, stream: String, user_id: String, data: Vec<u8>, keyframe: bool, pts: u32, rotation: u16);
     /// The encoder should react: a keyframe was requested, or the bitrate target changed (bits/s in `value`).
     /// `source` is `call` (camera) or the stream key (screen).
     fn on_video_control(&self, account: String, source: String, kind: VideoControlKind, value: u32);

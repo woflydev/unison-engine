@@ -4,6 +4,16 @@ use super::*;
 
 use unison_core::localstate::{RecentReaction, UserVoice};
 
+/// How much the on-device search history holds, and what the chosen level allows.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct IndexUsage {
+    pub bytes: u64,
+    pub messages: u64,
+    /// 0 when unlimited.
+    pub budget_bytes: u64,
+    pub per_channel: u32,
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct RecentEmoji {
     pub key: String,
@@ -15,8 +25,61 @@ fn to_ffi(r: RecentReaction) -> RecentEmoji {
     RecentEmoji { key: r.key, name: r.name, url: r.url }
 }
 
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq)]
+pub enum WelcomeStep {
+    Hello,
+    Search,
+    Appearance,
+    Privacy,
+    Features,
+    Finish,
+}
+
+/// The guide's steps in order (`unison_core::welcome`); `from` is the revision already seen.
+#[uniffi::export]
+pub fn welcome_steps(from: u32) -> Vec<WelcomeStep> {
+    use unison_core::welcome::Step as S;
+    unison_core::welcome::steps(from)
+        .into_iter()
+        .map(|s| match s {
+            S::Hello => WelcomeStep::Hello,
+            S::Search => WelcomeStep::Search,
+            S::Appearance => WelcomeStep::Appearance,
+            S::Privacy => WelcomeStep::Privacy,
+            S::Features => WelcomeStep::Features,
+            S::Finish => WelcomeStep::Finish,
+        })
+        .collect()
+}
+
 #[uniffi::export]
 impl UnisonEngine {
+    /// The revision to start the guide after (0 plays everything), or nothing when it should not
+    /// show now. Someone who already uses Unison is marked as having seen it here.
+    pub fn welcome_plan(&self, has_accounts: bool) -> Option<u32> {
+        use unison_core::welcome::{plan, used_before, Plan};
+        let dir = self.policy_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let l = &self.inner.local;
+        match plan(l.welcome_seen(), l.welcome_replay(), has_accounts, used_before(&dir)) {
+            Plan::Show { from } => Some(from),
+            Plan::MarkSeen => {
+                l.set_welcome_seen();
+                None
+            }
+            Plan::Skip => None,
+        }
+    }
+
+    /// The guide finished or was skipped.
+    pub fn finish_welcome(&self) {
+        self.inner.local.set_welcome_seen();
+    }
+
+    /// Settings: show the whole guide on the next launch.
+    pub fn replay_welcome_next_launch(&self) {
+        self.inner.local.request_welcome_replay();
+    }
+
     pub fn draft(&self, account_id: String, channel_id: String) -> String {
         self.inner.local.draft(&account_id, &channel_id)
     }
@@ -39,6 +102,26 @@ impl UnisonEngine {
 
     pub fn record_reaction(&self, key: String, name: String, url: Option<String>) -> Vec<RecentEmoji> {
         self.inner.local.record_reaction(RecentReaction { key, name, url }).into_iter().map(to_ffi).collect()
+    }
+
+    /// Search history level: 0 Standard, 1 Large, 2 Unlimited.
+    pub fn index_level(&self) -> u8 {
+        self.inner.local.index_level()
+    }
+
+    pub fn set_index_level(&self, level: u8) {
+        self.inner.set_index_level(level);
+    }
+
+    pub fn index_usage(&self) -> IndexUsage {
+        let (bytes, messages) = self.inner.index_usage();
+        let (budget, per_channel) = unison_core::localstate::index_limits(self.inner.local.index_level());
+        IndexUsage { bytes, messages, budget_bytes: budget, per_channel: per_channel as u32 }
+    }
+
+    /// Forget every stored message (what search finds on this device); Discord is untouched.
+    pub fn clear_index(&self) {
+        self.inner.clear_index();
     }
 
     pub fn reply_ping(&self) -> bool {

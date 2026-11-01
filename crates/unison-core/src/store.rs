@@ -792,6 +792,11 @@ impl Store {
             }
             "VOICE_STATE_UPDATE" => {
                 let v: VoiceState = de!();
+                if v.channel_id.is_some() && v.channel_id == self.voice.channel {
+                    // Who in our call is muted, deafened or sending video, as Discord said it.
+                    tracing::debug!(target: "unison_core::voice", user = v.user_id.0, self_mute = v.self_mute, self_deaf = v.self_deaf,
+                        mute = v.mute, deaf = v.deaf, self_video = v.self_video, self_stream = ?v.self_stream, "call voice state");
+                }
                 let Some(g) = v.guild_id else {
                     // A DM or group-DM call.
                     for m in self.dm_voice.values_mut() {
@@ -926,6 +931,31 @@ impl Store {
             }
             "VOICE_SERVER_UPDATE" | "VOICE_CHANNEL_STATUS_UPDATE" | "VOICE_CHANNEL_START_TIME_UPDATE" => vec![],
             "CONVERSATION_SUMMARY_UPDATE" | "PASSIVE_UPDATE_V2" | "RESUMED" => vec![],
+            // Real dispatch events we deliberately do not model: nothing on screen depends on them
+            // (integrations, bans and invites are read through REST when the admin panels open; the
+            // member list comes from GUILD_MEMBER_LIST_UPDATE; webhooks, the audit log and command
+            // counts are read on demand). Accepting them keeps About's "not modelled yet" list for
+            // events that are genuinely new.
+            "GUILD_INTEGRATIONS_UPDATE"
+            | "INTEGRATION_CREATE"
+            | "INTEGRATION_UPDATE"
+            | "INTEGRATION_DELETE"
+            | "GUILD_BAN_ADD"
+            | "GUILD_BAN_REMOVE"
+            | "GUILD_MEMBER_REMOVE"
+            | "GUILD_AUDIT_LOG_ENTRY_CREATE"
+            | "WEBHOOKS_UPDATE"
+            | "INVITE_CREATE"
+            | "INVITE_DELETE"
+            | "GUILD_APPLICATION_COMMAND_COUNTS_UPDATE"
+            | "APPLICATION_COMMAND_PERMISSIONS_UPDATE"
+            | "CHANNEL_UNREAD_UPDATE"
+            | "CHANNEL_PINS_ACK"
+            | "PRESENCES_REPLACE"
+            | "GUILD_SOUNDBOARD_SOUND_CREATE"
+            | "GUILD_SOUNDBOARD_SOUND_UPDATE"
+            | "GUILD_SOUNDBOARD_SOUND_DELETE"
+            | "GUILD_SOUNDBOARD_SOUNDS_UPDATE" => vec![],
             other => {
                 *self.unknown_events.entry(other.to_string()).or_default() += 1;
                 vec![]
@@ -1916,6 +1946,15 @@ impl Store {
         v
     }
 
+    /// We are in a 1:1 DM call with nobody else in it: the one case where the official client
+    /// leaves by itself after `session::CALL_IDLE_LEAVE` (its `CallIdleManager`). Servers and group
+    /// DMs never qualify.
+    pub fn alone_in_dm_call(&self) -> bool {
+        let (Some(ch), Some(me)) = (self.voice.channel, self.my_id()) else { return false };
+        self.channels.get(&ch).is_some_and(|c| c.kind == channel_type::DM)
+            && self.dm_voice.get(&ch).is_none_or(|m| m.keys().all(|u| *u == me))
+    }
+
     /// A call is ongoing while at least one person is in it, whether or not we are.
     pub fn dm_call_ongoing(&self, channel: Id) -> bool {
         self.dm_voice.get(&channel).is_some_and(|m| !m.is_empty())
@@ -2236,7 +2275,7 @@ impl Store {
         }
         self.guild_channels.get(&guild).is_some_and(|chs| {
             chs.iter().filter_map(|c| self.channels.get(c)).any(|c| {
-                c.is_text_like() && !c.is_thread() && !self.is_channel_muted(c) && self.can_view(c) && self.is_unread(c)
+                c.has_text_chat() && !c.is_thread() && !self.is_channel_muted(c) && self.can_view(c) && self.is_unread(c)
             })
         })
     }

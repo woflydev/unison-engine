@@ -25,7 +25,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 wreq = { version = "=6.0.0-rc.31", default-features = false, features = ["webpki-roots", "tokio-rt", "gzip", "brotli", "deflate", "zstd", "stream"] }
 wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-zstd-safe = { version = "8", features = ["std"] }
+zstd-safe = { version = "8", features = ["std", "zdict_builder"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 rand = "0.8"

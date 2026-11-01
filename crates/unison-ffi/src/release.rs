@@ -138,6 +138,14 @@ pub fn update_install_route(location_writable: bool, read_only_location: bool) -
     }
 }
 
+/// The sentence to show beside "Update and Restart" for this build, if any (an ad hoc signed build
+/// makes macOS ask for the saved sign-in once after the update).
+#[uniffi::export]
+pub fn update_restart_note(running: CodeIdentity) -> Option<String> {
+    let id = install::CodeIdentity { identifier: running.identifier, version: running.version, team_id: running.team_id, ad_hoc: running.ad_hoc };
+    install::restart_keychain_note(&id).map(str::to_string)
+}
+
 #[uniffi::export]
 pub fn update_restart_gate(in_call: bool) -> RestartGate {
     match install::restart_gate(in_call) {

@@ -43,7 +43,7 @@ pub use auth::{LoginOutcome, MfaChallenge};
 pub use forums::NewForumPost;
 pub use nav::{channel_override_body, mute_body, SearchQuery, MUTE_WINDOWS};
 pub(crate) use messages::attachment_json;
-pub use messages::{ForwardSource, LocalFile, OutgoingMessage, UploadedAttachment};
+pub use messages::{ForwardSource, LocalFile, OutgoingMessage, UploadedAttachment, VoiceMeta};
 
 /// Longest we will wait on our own for a rate-limit reset before surfacing it to the UI.
 const MAX_SILENT_WAIT: Duration = Duration::from_secs(5);

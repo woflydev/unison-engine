@@ -135,8 +135,11 @@ impl AudioParams {
     }
 }
 
-/// Frames of silence before speaking ends (300 ms).
-pub const HANG_FRAMES: u32 = 15;
+/// Frames of silence before speaking ends (about 260 ms). The official default is `vadTrailing` 25
+/// (web bundle `MediaEngineStore`, native `CreateDefaultVadSettings` 0x19), counted in WebRTC's 10 ms
+/// frames (an inference: the native gate runs per `OnPreEncode` audio frame), so about 250 ms; our
+/// frames are 20 ms. `vadLeading` 5 (50 ms) is not modelled.
+pub const HANG_FRAMES: u32 = 13;
 /// Auto sensitivity keeps the threshold this far above the tracked noise floor.
 const AUTO_MARGIN_DB: f32 = 12.0;
 const AUTO_MIN_DB: f32 = -60.0;

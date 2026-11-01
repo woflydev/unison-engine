@@ -11,6 +11,7 @@ pub mod dave;
 pub mod params;
 pub mod h264;
 pub mod protocol;
+pub mod recv;
 pub mod rtcp;
 pub mod rtp;
 pub mod stream;

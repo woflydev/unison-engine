@@ -163,6 +163,15 @@ fn unknown_events_are_counted_not_fatal() {
 }
 
 #[test]
+fn documented_dispatch_events_are_known() {
+    let mut s = store();
+    for e in ["GUILD_INTEGRATIONS_UPDATE", "INTEGRATION_UPDATE", "INTEGRATION_CREATE", "INTEGRATION_DELETE", "GUILD_BAN_ADD", "GUILD_MEMBER_REMOVE", "INVITE_CREATE", "WEBHOOKS_UPDATE"] {
+        assert!(s.apply(e, &term(json!({"guild_id": "100"}))).unwrap().is_empty());
+    }
+    assert!(s.unknown_events.is_empty(), "{:?}", s.unknown_events);
+}
+
+#[test]
 fn new_fields_do_not_break_decoding() {
     let mut s = store();
     let m = json!({"id": "9", "channel_id": "11", "author": {"id": "2", "brand_new": [1, 2]}, "content": "x",
@@ -471,6 +480,23 @@ fn dm_call_participants_follow_call_and_voice_state_events() {
     assert_eq!(s.dm_voice[&Snowflake(20)].len(), 1);
     s.apply("CALL_DELETE", &term(json!({"channel_id": "20"}))).unwrap();
     assert!(s.dm_voice.is_empty());
+}
+
+#[test]
+fn alone_in_dm_call_only_for_a_one_to_one_dm_with_nobody_else() {
+    let mut s = store();
+    let me = me_id(&s);
+    s.channels.insert(Snowflake(20), Channel { id: Snowflake(20), kind: channel_type::DM, ..Default::default() });
+    s.channels.insert(Snowflake(21), Channel { id: Snowflake(21), kind: channel_type::GROUP_DM, ..Default::default() });
+    assert!(!s.alone_in_dm_call(), "not in a call");
+    s.voice.channel = Some(Snowflake(20));
+    assert!(s.alone_in_dm_call());
+    s.apply("VOICE_STATE_UPDATE", &term(json!({"user_id": me.0.to_string(), "channel_id": "20", "session_id": "x"}))).unwrap();
+    assert!(s.alone_in_dm_call(), "our own state does not count");
+    s.apply("VOICE_STATE_UPDATE", &term(json!({"user_id": "2", "channel_id": "20", "session_id": "y"}))).unwrap();
+    assert!(!s.alone_in_dm_call());
+    s.voice.channel = Some(Snowflake(21));
+    assert!(s.alone_in_dm_call() == false, "a group DM never idles out");
 }
 
 fn me_id(s: &Store) -> Snowflake {

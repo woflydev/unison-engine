@@ -61,10 +61,14 @@ pub struct IdentifyInput<'a> {
     pub session_id: &'a str,
     pub token: &'a str,
     pub max_dave_protocol_version: u16,
+    /// A Go Live connection (publisher or viewer): the official client's stream context describes its
+    /// stream as `screen`, the call's as `video` (`getVideoStreamParameters(context)`).
+    pub screen: bool,
 }
 
-/// Op 0. `streams` describes the one video stream a desktop client offers even when its
-/// camera is off; **capture** pending (FIDELITY.md, voice).
+/// Op 0. `streams` is what `getVideoStreamParameters` returns: one `{type, rid:"100", quality:100}`
+/// entry, `screen` on a Go Live connection and `video` on the call (web bundle 2026-10-30,
+/// `RTCControlSocket.identify`; undefined keys are not serialised).
 pub fn identify(i: &IdentifyInput) -> Value {
     json!({ "op": op::IDENTIFY, "d": {
         "server_id": i.server_id.to_string(),
@@ -74,13 +78,18 @@ pub fn identify(i: &IdentifyInput) -> Value {
         "token": i.token,
         "max_dave_protocol_version": i.max_dave_protocol_version,
         "video": true,
-        "streams": [{ "type": "video", "rid": "100", "quality": 100 }],
+        "streams": [{ "type": if i.screen { "screen" } else { "video" }, "rid": "100", "quality": 100 }],
     }})
 }
 
-/// Op 3 (v ≥ 4): a millisecond timestamp and the last server `seq` seen.
-pub fn heartbeat(t_ms: u64, seq_ack: Option<i64>) -> Value {
-    json!({ "op": op::HEARTBEAT, "d": { "t": t_ms, "seq_ack": seq_ack } })
+/// Op 3. From server version 8 the data is `{t, seq_ack}` with `-1` until a sequenced frame has
+/// arrived; before that it is the bare timestamp (`RTCControlSocket.sendHeartbeat`).
+pub fn heartbeat(t_ms: u64, seq_ack: Option<i64>, server_version: u8) -> Value {
+    if server_version >= 8 {
+        json!({ "op": op::HEARTBEAT, "d": { "t": t_ms, "seq_ack": seq_ack.unwrap_or(-1) } })
+    } else {
+        json!({ "op": op::HEARTBEAT, "d": t_ms })
+    }
 }
 
 pub fn resume(token: &str, session_id: &str, server_id: Id, channel_id: Id, seq_ack: Option<i64>) -> Value {
@@ -89,7 +98,7 @@ pub fn resume(token: &str, session_id: &str, server_id: Id, channel_id: Id, seq_
         "session_id": session_id,
         "server_id": server_id.to_string(),
         "channel_id": channel_id.to_string(),
-        "seq_ack": seq_ack,
+        "seq_ack": seq_ack.unwrap_or(-1),
     }})
 }
 
@@ -98,12 +107,35 @@ pub fn resume(token: &str, session_id: &str, server_id: Id, channel_id: Id, seq_
 pub fn codecs() -> Value {
     json!([
         { "name": "opus", "type": "audio", "priority": 1000, "payload_type": 120 },
-        { "name": "AV1", "type": "video", "priority": 1000, "payload_type": 101, "rtx_payload_type": 102, "encode": false, "decode": false },
-        { "name": "H265", "type": "video", "priority": 2000, "payload_type": 103, "rtx_payload_type": 104, "encode": false, "decode": false },
-        { "name": "H264", "type": "video", "priority": 3000, "payload_type": 105, "rtx_payload_type": 106, "encode": true, "decode": true },
-        { "name": "VP8", "type": "video", "priority": 4000, "payload_type": 107, "rtx_payload_type": 108, "encode": false, "decode": false },
-        { "name": "VP9", "type": "video", "priority": 5000, "payload_type": 109, "rtx_payload_type": 110, "encode": false, "decode": false },
+        video_codec(0, "AV1", false, false),
+        video_codec(1, "H265", false, false),
+        video_codec(2, "H264", true, true),
+        video_codec(3, "VP8", false, false),
     ])
+}
+
+/// Video codec `i` of the list: priority `1000 × (i + 1)`, payload type `101 + 2i`, RTX one above
+/// (`RTCConnection.initialize`: `priority: t + 1`, `payloadType: 101 + 2 * t`; `e$` multiplies the
+/// priority by 1000).
+fn video_codec(i: u8, name: &str, encode: bool, decode: bool) -> Value {
+    let pt = VIDEO_PT_BASE + 2 * i;
+    json!({ "name": name, "type": "video", "priority": 1000 * (i as u32 + 1), "payload_type": pt, "rtx_payload_type": pt + 1, "encode": encode, "decode": decode })
+}
+
+/// First video payload type; the codec at index `i` gets `101 + 2i` and RTX `102 + 2i`.
+pub const VIDEO_PT_BASE: u8 = 101;
+/// Where H.264 sits in [`codecs`]. The official desktop on a Mac signals AV1 decode
+/// (`SIGNAL_AV1_DECODE`, `SIGNAL_AV1_HARDWARE_DECODE`) and has H265, so its list is AV1, H265, H264, VP8
+/// (web bundle `setupMediaEngine`, `y`, `L`; `discord_voice.node` reports the codecs). We list all four
+/// at the official numbers but say `encode`/`decode` false for what we cannot do, which is the one
+/// deliberate difference.
+pub const H264_INDEX: u8 = 2;
+
+/// The experiments the client itself switches on (`RTCConnection._chooseExperiments`): not an echo
+/// of the server's READY list. A desktop call with no remote-config extras sends only this one,
+/// which we honour (the server's `keyframe_interval` drives periodic keyframes, `video.rs`).
+pub fn client_experiments() -> Vec<String> {
+    vec!["fixed_keyframe_interval".to_string()]
 }
 
 /// Op 1, `selectProtocol` for the UDP path: `data` holds the discovered address, and the same
@@ -119,6 +151,31 @@ pub fn select_protocol(address: &str, port: u16, mode: &str, rtc_connection_id: 
         "rtc_connection_id": rtc_connection_id,
         "experiments": experiments,
     }})
+}
+
+/// Which speaking changes the desktop client sends as op 5 (`RTCConnection.shouldSendSpeaking`, web
+/// bundle 2026-10-30): the first time it speaks (and again if the SSRC changes), and when the
+/// priority-speaker bit flips. Starting and stopping to speak again is not sent: the server hears
+/// it from the audio itself.
+#[derive(Default)]
+pub struct SpeakingGate {
+    last: Option<(u32, u32)>, // (ssrc, status)
+}
+
+impl SpeakingGate {
+    pub fn should_send(&mut self, status: u32, ssrc: u32) -> bool {
+        const PRIORITY: u32 = 4;
+        let (last_ssrc, last_status) = match self.last {
+            Some((s, st)) => (Some(s), st),
+            None => (None, 0),
+        };
+        let changed = last_ssrc != Some(ssrc) || (status & PRIORITY) != (last_status & PRIORITY);
+        let ok = changed && (last_ssrc.is_some() || status != 0) && (last_ssrc == Some(ssrc) || status != 0);
+        if ok {
+            self.last = Some((ssrc, status));
+        }
+        ok
+    }
 }
 
 /// Op 5. `delay` is always 0 for microphone audio.
@@ -237,16 +294,36 @@ mod tests {
             session_id: "s",
             token: "t",
             max_dave_protocol_version: 1,
+            screen: false,
         });
         assert_eq!(
             v.to_string(),
             r#"{"op":0,"d":{"server_id":"1","channel_id":"2","user_id":"3","session_id":"s","token":"t","max_dave_protocol_version":1,"video":true,"streams":[{"type":"video","rid":"100","quality":100}]}}"#
         );
+        let s = identify(&IdentifyInput { server_id: Snowflake(1), channel_id: Snowflake(2), user_id: Snowflake(3), session_id: "s", token: "t", max_dave_protocol_version: 1, screen: true });
+        assert_eq!(s["d"]["streams"][0]["type"], "screen", "a Go Live connection describes its stream as screen");
+    }
+
+    #[test]
+    fn codec_list_follows_the_official_numbering() {
+        let c = codecs();
+        let c = c.as_array().unwrap();
+        // Audio first, then video at priority 1000 x (i + 1), payload 101 + 2i, RTX one above.
+        for (i, v) in c[1..].iter().enumerate() {
+            assert_eq!(v["priority"], 1000 * (i as u64 + 1));
+            assert_eq!(v["payload_type"], 101 + 2 * i as u64);
+            assert_eq!(v["rtx_payload_type"], 102 + 2 * i as u64);
+        }
+        let h264 = c.iter().find(|v| v["name"] == "H264").unwrap();
+        assert_eq!(h264["payload_type"], crate::voice::stream::H264_PT);
+        assert_eq!(h264["rtx_payload_type"], crate::voice::stream::H264_RTX_PT);
+        assert!(c.iter().all(|v| v["name"] != "VP9"), "VP9 is not in the default official list");
+        assert_eq!(h264["payload_type"], 105, "AV1 101, H265 103, H264 105, VP8 107 as on a Mac desktop");
     }
 
     #[test]
     fn select_protocol_spreads_address_like_the_client() {
-        let v = select_protocol("203.0.113.9", 5000, "aead_aes256_gcm_rtpsize", "uuid", &["fixed_keyframe_interval".into()]);
+        let v = select_protocol("203.0.113.9", 5000, "aead_aes256_gcm_rtpsize", "uuid", &client_experiments());
         let d = &v["d"];
         let keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["protocol", "data", "address", "port", "mode", "codecs", "rtc_connection_id", "experiments"]);
@@ -256,9 +333,22 @@ mod tests {
 
     #[test]
     fn heartbeat_and_speaking() {
-        assert_eq!(heartbeat(5, None).to_string(), r#"{"op":3,"d":{"t":5,"seq_ack":null}}"#);
-        assert_eq!(heartbeat(5, Some(9)).to_string(), r#"{"op":3,"d":{"t":5,"seq_ack":9}}"#);
+        assert_eq!(heartbeat(5, None, 9).to_string(), r#"{"op":3,"d":{"t":5,"seq_ack":-1}}"#);
+        assert_eq!(heartbeat(5, Some(9), 9).to_string(), r#"{"op":3,"d":{"t":5,"seq_ack":9}}"#);
+        assert_eq!(heartbeat(5, Some(9), 7).to_string(), r#"{"op":3,"d":5}"#, "before v8 the data is the bare timestamp");
         assert_eq!(speaking(1, 77).to_string(), r#"{"op":5,"d":{"speaking":1,"delay":0,"ssrc":77}}"#);
+    }
+
+    #[test]
+    fn speaking_is_sent_once_then_only_for_priority() {
+        let mut g = SpeakingGate::default();
+        assert!(!g.should_send(0, 77), "silence before the first word is not announced");
+        assert!(g.should_send(1, 77), "the first word");
+        assert!(!g.should_send(0, 77), "stopping is not sent");
+        assert!(!g.should_send(1, 77), "starting again is not sent");
+        assert!(g.should_send(1 | 4, 77), "priority speaker on");
+        assert!(g.should_send(1, 77), "priority speaker off");
+        assert!(g.should_send(1, 78), "a new SSRC is announced");
     }
 
     #[test]

@@ -30,6 +30,13 @@ impl Session {
         }
     }
 
+    pub async fn send_poll(&self, intent: UserIntent, channel: Id, draft: &crate::poll_create::PollDraft) -> Result<()> {
+        if let Some(why) = crate::poll_create::refusal(draft) {
+            return Err(crate::Error::Other(why));
+        }
+        self.rest.send_poll(intent, channel, Snowflake::nonce_now(), draft).await
+    }
+
     pub async fn send_sticker(&self, intent: UserIntent, channel: Id, sticker: Id) -> Result<()> {
         self.rest.send_sticker(intent, channel, Snowflake::nonce_now(), sticker).await
     }

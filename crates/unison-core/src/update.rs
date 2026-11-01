@@ -150,6 +150,32 @@ pub fn channel_accepts(offered: &str, wanted: &str) -> bool {
 }
 
 /// The feed to ask: stable uses `base` itself, beta the sibling `<name>-beta.json`.
+/// What the person chose about updates, plus when we last asked the feed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatePrefs {
+    pub auto_check: bool,
+    pub beta: bool,
+    pub last_check_ms: u64,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        Self { auto_check: true, beta: false, last_check_ms: 0 }
+    }
+}
+
+impl UpdatePrefs {
+    pub fn channel(&self) -> &'static str {
+        if self.beta { "beta" } else { "stable" }
+    }
+
+    /// The launch check runs only when it is on and a day has passed since the last one.
+    pub fn check_due(&self, now_ms: u64) -> bool {
+        self.auto_check && (self.last_check_ms == 0 || now_ms.saturating_sub(self.last_check_ms) >= 86_400_000)
+    }
+}
+
 pub fn feed_url(base: &str, channel: &str) -> String {
     if norm_channel(channel) == STABLE {
         return base.to_string();
@@ -201,6 +227,20 @@ pub fn evaluate(signed_json: &str, public_key_b64: &str, platform: &Platform, cu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_check_waits_a_day_and_respects_the_switch() {
+        use super::UpdatePrefs;
+        let day = 86_400_000;
+        let mut p = UpdatePrefs::default();
+        assert!(p.check_due(5));
+        p.last_check_ms = 1_000;
+        assert!(!p.check_due(1_000 + day - 1));
+        assert!(p.check_due(1_000 + day));
+        p.auto_check = false;
+        assert!(!p.check_due(1_000 + 10 * day));
+        assert_eq!(UpdatePrefs { beta: true, ..Default::default() }.channel(), "beta");
+    }
+
     use super::*;
     use ed25519_dalek::Signer;
 

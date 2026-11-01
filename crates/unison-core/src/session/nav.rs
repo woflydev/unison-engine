@@ -107,6 +107,21 @@ impl Session {
     /// than a person asks, and never while automation is on (`rest::set_automation`).
     pub const SEARCH_FRESH: std::time::Duration = std::time::Duration::from_secs(45);
 
+    /// What Discord's search returned joins the on-device index (hits and their context messages).
+    fn index_found(&self, response: &Value) {
+        let mut by_channel: std::collections::HashMap<Id, Vec<Message>> = std::collections::HashMap::new();
+        for group in response.get("messages").and_then(Value::as_array).into_iter().flatten() {
+            for m in group.as_array().into_iter().flatten() {
+                if let Ok(m) = serde_json::from_value::<Message>(m.clone()) {
+                    by_channel.entry(m.channel_id).or_default().push(m);
+                }
+            }
+        }
+        for (channel, msgs) in by_channel {
+            let _ = self.cache.index_found(channel, &msgs);
+        }
+    }
+
     pub async fn search_filtered(&self, guild: Option<Id>, channel: Id, q: &SearchQuery) -> Result<Value> {
         let key = format!("{guild:?}/{channel}?{}", q.to_query());
         if let Some(v) = self.search_pages.lock().get(&key, Self::SEARCH_FRESH) {
@@ -120,6 +135,7 @@ impl Session {
         self.reads.finish(&flight, false);
         if let Ok(v) = &r {
             self.search_pages.lock().put(key, v.clone());
+            self.index_found(v);
         }
         r
     }

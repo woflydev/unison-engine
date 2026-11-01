@@ -111,7 +111,31 @@ impl Engine {
     }
 
     fn cache_for(&self, user: Id) -> Result<Arc<Cache>> {
-        Ok(Arc::new(Cache::open(&self.data_dir.join(format!("account-{user}.sqlite")))?))
+        let cache = Arc::new(Cache::open(&self.data_dir.join(format!("account-{user}.sqlite")))?);
+        let (bytes, per_channel) = crate::localstate::index_limits(self.local.index_level());
+        cache.set_limits(bytes, per_channel);
+        Ok(cache)
+    }
+
+    /// Change how much message history is kept for search, for every account at once.
+    pub fn set_index_level(&self, level: u8) {
+        self.local.set_index_level(level);
+        let (bytes, per_channel) = crate::localstate::index_limits(self.local.index_level());
+        for s in self.sessions_snapshot() {
+            s.cache.set_limits(bytes, per_channel);
+            let _ = s.cache.enforce_budget();
+        }
+    }
+
+    /// Bytes and messages the search history holds across the signed-in accounts.
+    pub fn index_usage(&self) -> (u64, u64) {
+        self.sessions_snapshot().iter().fold((0, 0), |(b, m), s| (b + s.cache.used_bytes().unwrap_or(0), m + s.cache.message_count().unwrap_or(0)))
+    }
+
+    pub fn clear_index(&self) {
+        for s in self.sessions_snapshot() {
+            let _ = s.cache.clear_messages();
+        }
     }
 
     // ----- Accounts -----
@@ -331,6 +355,18 @@ impl Engine {
 
     pub fn session(&self, user: Id) -> Option<Arc<Session>> {
         self.sessions.read().iter().find(|s| s.user_id == user).cloned()
+    }
+
+    /// One call at a time across every signed-in account, as in one official client: a call joined
+    /// (or started, or accepted) on `joining` first leaves the call any other account is in. Called
+    /// only from those join gestures, so it never acts on its own.
+    pub fn leave_other_calls(&self, joining: Id) {
+        for s in self.sessions_snapshot() {
+            if s.user_id != joining && s.in_call() {
+                tracing::debug!(target: "unison_core::voice", left = s.user_id.0, joining = joining.0, "one call at a time: leaving the other account's call");
+                s.hang_up();
+            }
+        }
     }
 
     pub fn sessions_snapshot(&self) -> Vec<Arc<Session>> {

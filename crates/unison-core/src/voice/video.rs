@@ -402,33 +402,71 @@ pub struct VideoSender {
     pub gate: KeyframeGate,
     pub controller: BitrateController,
     last_reported: u32,
+    /// Transport-wide sequence number carried by every video and RTX packet (extension id 5).
+    twcc_seq: u16,
+    /// Sender statistics for the periodic sender report: packets, payload octets, the last RTP
+    /// timestamp and when it was sent.
+    pub stats: SenderStats,
+}
+
+/// What a sender report needs about one outgoing stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SenderStats {
+    pub packets: u32,
+    pub octets: u32,
+    pub last_rtp_ts: u32,
+    pub last_sent_ms: u64,
+}
+
+impl SenderStats {
+    pub fn on_packet(&mut self, payload_len: usize, rtp_ts: u32, now_ms: u64) {
+        self.packets = self.packets.wrapping_add(1);
+        self.octets = self.octets.wrapping_add(payload_len as u32);
+        self.last_rtp_ts = rtp_ts;
+        self.last_sent_ms = now_ms;
+    }
+
+    /// The RTP timestamp that matches `now_ms`, extrapolated from the last packet at `clock_khz`.
+    pub fn rtp_ts_at(&self, now_ms: u64, clock_khz: u32) -> u32 {
+        self.last_rtp_ts.wrapping_add((now_ms.saturating_sub(self.last_sent_ms) as u32).wrapping_mul(clock_khz))
+    }
 }
 
 impl VideoSender {
     pub fn new(pt: u8, rtx_pt: u8, ssrc: u32, rtx_ssrc: u32, controller: BitrateController) -> Self {
         let last_reported = controller.target();
-        Self { pt, rtx_pt, ssrc, rtx_ssrc, seq: 0, rtx_seq: 0, history: NackHistory::new(512), gate: KeyframeGate::new(1000), controller, last_reported }
+        Self { pt, rtx_pt, ssrc, rtx_ssrc, seq: 0, rtx_seq: 0, history: NackHistory::new(512), gate: KeyframeGate::new(1000), controller, last_reported, twcc_seq: 0, stats: SenderStats::default() }
     }
 
-    /// Packetize an access unit stamped at `pts_90k`. Returns plaintext RTP packets.
-    pub fn send_frame(&mut self, nals: &[&[u8]], pts_90k: u32) -> Vec<Vec<u8>> {
+    fn next_twcc(&mut self) -> u16 {
+        let s = self.twcc_seq;
+        self.twcc_seq = self.twcc_seq.wrapping_add(1);
+        s
+    }
+
+    /// Packetize an access unit stamped at `pts_90k`. Returns plaintext RTP packets, each with the
+    /// abs-send-time and transport-wide sequence extensions (split for sealing with `rtp::seal_split`).
+    pub fn send_frame(&mut self, nals: &[&[u8]], pts_90k: u32, now_ms: u64) -> Vec<Vec<u8>> {
         crate::voice::h264::packetize(nals, crate::voice::h264::MAX_PAYLOAD)
             .into_iter()
             .map(|(payload, marker)| {
                 let seq = self.seq;
                 self.seq = self.seq.wrapping_add(1);
-                let mut pkt = crate::voice::h264::rtp_header(self.pt, marker, seq, pts_90k, self.ssrc).to_vec();
+                let tw = self.next_twcc();
+                let mut pkt = crate::voice::h264::rtp_header_ext(self.pt, marker, seq, pts_90k, self.ssrc, now_ms, tw);
                 pkt.extend_from_slice(&payload);
+                self.stats.on_packet(payload.len(), pts_90k, now_ms);
                 self.history.store(seq, pts_90k, payload);
                 pkt
             })
             .collect()
     }
 
-    fn rtx_packet(&mut self, orig_seq: u16, ts: u32, payload: &[u8], marker: bool) -> Vec<u8> {
+    fn rtx_packet(&mut self, orig_seq: u16, ts: u32, payload: &[u8], marker: bool, now_ms: u64) -> Vec<u8> {
         let seq = self.rtx_seq;
         self.rtx_seq = self.rtx_seq.wrapping_add(1);
-        let mut pkt = crate::voice::h264::rtp_header(self.rtx_pt, marker, seq, ts, self.rtx_ssrc).to_vec();
+        let tw = self.next_twcc();
+        let mut pkt = crate::voice::h264::rtp_header_ext(self.rtx_pt, marker, seq, ts, self.rtx_ssrc, now_ms, tw);
         pkt.extend_from_slice(&crate::voice::h264::rtx_payload(orig_seq, payload));
         pkt
     }
@@ -439,7 +477,7 @@ impl VideoSender {
         match pkt {
             Rtcp::Nack { media, seqs, .. } if *media == self.ssrc => {
                 let found: Vec<(u16, u32, Vec<u8>)> = self.history.retransmits(seqs, 64).into_iter().map(|(s, t, p)| (s, t, p.to_vec())).collect();
-                let pkts: Vec<Vec<u8>> = found.iter().map(|(s, t, p)| self.rtx_packet(*s, *t, p, false)).collect();
+                let pkts: Vec<Vec<u8>> = found.iter().map(|(s, t, p)| self.rtx_packet(*s, *t, p, false, now_ms)).collect();
                 if !pkts.is_empty() {
                     out.push(SenderAction::Retransmit(pkts));
                 }
@@ -604,7 +642,7 @@ mod tests {
         let mut s = VideoSender::new(105, 106, 11, 12, BitrateController::new(4_000_000, 200_000, 8_000_000));
         let idr = vec![0x65u8; 3000];
         let sps = [0x67u8, 1, 2];
-        let pkts = s.send_frame(&[&sps, &idr], 9000);
+        let pkts = s.send_frame(&[&sps, &idr], 9000, 1000);
         assert!(pkts.len() >= 3);
         let first = crate::voice::rtp::parse(&pkts[0]).unwrap();
         assert_eq!((first.ssrc, first.seq, first.payload_type), (11, 0, 105));
@@ -615,7 +653,13 @@ mod tests {
         assert_eq!(r.len(), 2);
         let h = crate::voice::rtp::parse(&r[0]).unwrap();
         assert_eq!((h.ssrc, h.payload_type), (12, 106));
-        assert_eq!(crate::voice::h264::rtx_unwrap(&r[0][12..]).unwrap().0, 1);
+        assert_eq!(crate::voice::h264::rtx_unwrap(&r[0][24..]).unwrap().0, 1);
+        // Every packet, RTX included, carries the transport-wide sequence number, counting up.
+        let seq_of = |p: &[u8]| u16::from_be_bytes([p[21], p[22]]);
+        assert_eq!(seq_of(&pkts[0]), 0);
+        assert_eq!(seq_of(&pkts[1]), 1);
+        assert_eq!(seq_of(&r[0]), pkts.len() as u16);
+        assert_eq!(s.stats.packets, pkts.len() as u32);
         // PLI forces a keyframe, rate limited; wrong SSRC is ignored.
         let pli = rtcp::parse(&rtcp::pli(99, 11));
         assert_eq!(s.on_rtcp(10, &pli[0]), vec![SenderAction::Keyframe]);

@@ -56,6 +56,11 @@ impl Transport {
 
     /// Decrypt an incoming RTP packet; returns the media payload with any extension body removed.
     pub fn open(&self, packet: &[u8], rtp: &Incoming) -> Option<Vec<u8>> {
+        self.open_parts(packet, rtp).map(|(_, payload)| payload)
+    }
+
+    /// Decrypt an incoming RTP packet into its header-extension body and its media payload.
+    pub fn open_parts(&self, packet: &[u8], rtp: &Incoming) -> Option<(Vec<u8>, Vec<u8>)> {
         if packet.len() < rtp.aad_len + 16 + 4 {
             return None;
         }
@@ -66,13 +71,11 @@ impl Transport {
             Cipher::Aes(c) => c.decrypt(GcmNonce::from_slice(&nonce12(n)), msg).ok()?,
             Cipher::XChaCha(c) => c.decrypt(XNonce::from_slice(&nonce24(n)), msg).ok()?,
         };
-        if rtp.ext_body_len > 0 {
-            if plain.len() < rtp.ext_body_len {
-                return None;
-            }
-            plain.drain(..rtp.ext_body_len);
+        if plain.len() < rtp.ext_body_len {
+            return None;
         }
-        Some(plain)
+        let payload = plain.split_off(rtp.ext_body_len);
+        Some((plain, payload))
     }
 }
 

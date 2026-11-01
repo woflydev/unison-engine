@@ -42,6 +42,15 @@ impl Rest {
     }
 }
 
+impl Rest {
+    /// A message that is just a poll (`crate::poll_create::body`, `capture`).
+    pub async fn send_poll(&self, intent: UserIntent, channel: Id, nonce: Snowflake, draft: &crate::poll_create::PollDraft) -> Result<()> {
+        let body = crate::poll_create::body(nonce, draft);
+        let _: Value = self.write(intent, Method::POST, &format!("/channels/{channel}/messages"), Some(body)).await?;
+        Ok(())
+    }
+}
+
 fn sticker_body(nonce: Snowflake, sticker: Id) -> Value {
     json!({
         "mobile_network_type": "unknown",

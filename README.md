@@ -8,13 +8,20 @@ The Rust engine behind Unison, a native Discord client: protocol, state, rules, 
 | `unison-ffi` | The one surface a shell calls (UniFFI: Swift, Kotlin, Python bindings) |
 | `unison-etf`, `unison-markdown` | Discord's term format, message markdown |
 
-## Use it from Rust, pinned to a release
+## Use it from Rust
+Follow the latest release. `main` always points at the newest tag:
 ```toml
 [dependencies]
-unison-ffi = { git = "https://github.com/woflydev/unison-engine", tag = "v0.2.0" }
-unison-core = { git = "https://github.com/woflydev/unison-engine", tag = "v0.2.0" }
+unison-ffi = { git = "https://github.com/woflydev/unison-engine", branch = "main" }
+unison-core = { git = "https://github.com/woflydev/unison-engine", branch = "main" }
 ```
-To take a newer release, change the tag and run `cargo update -p unison-core -p unison-ffi`. To follow the latest release without editing, use `branch = "main"` (it always points at the newest tag) and run `cargo update`. Tags never move, so a pinned build is reproducible.
+Run `cargo update -p unison-core -p unison-ffi` to take a new release.
+
+Need a build that never changes? Pin a tag instead (tags never move, so a pinned build is reproducible), and bump it when you want a newer release:
+```toml
+unison-ffi = { git = "https://github.com/woflydev/unison-engine", tag = "vX.Y.Z" }
+```
+Every release also has a zip of its source at `https://github.com/woflydev/unison-engine/archive/refs/tags/vX.Y.Z.zip`.
 
 ## Build a shell for a new platform
 Read `docs/ARCHITECTURE.md` first (what belongs in the engine and what in a shell), then `docs/PORTING.md`. The releases page carries a devkit zip with prebuilt libraries, generated bindings and a guide written for coding agents.

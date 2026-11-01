@@ -22,6 +22,14 @@ pub struct CodeIdentity {
     pub ad_hoc: bool,
 }
 
+/// A heads-up shown next to "Update and Restart" when this build is signed ad hoc. Keychain trusts an
+/// ad hoc app only as that exact binary, so the updated app has to ask for the saved sign-in once;
+/// a Deny there leaves the person signed out. Builds signed by a team are trusted across updates.
+pub fn restart_keychain_note(running: &CodeIdentity) -> Option<&'static str> {
+    (running.ad_hoc && running.team_id.is_none())
+        .then_some("After the restart, macOS asks if Unison can use its saved sign-in. Choose Always Allow to stay signed in.")
+}
+
 /// Why an update was not installed. Each has one plain sentence that says what to do next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
@@ -167,6 +175,13 @@ impl Stage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keychain_note_only_for_ad_hoc_builds() {
+        let id = |ad_hoc: bool, team: Option<&str>| super::CodeIdentity { identifier: "app.unison.client".into(), version: "0.3.0".into(), team_id: team.map(Into::into), ad_hoc };
+        assert!(super::restart_keychain_note(&id(true, None)).is_some());
+        assert!(super::restart_keychain_note(&id(false, Some("ABCDE12345"))).is_none());
+    }
+
     use super::*;
 
     fn ident(team: Option<&str>, version: &str) -> CodeIdentity {

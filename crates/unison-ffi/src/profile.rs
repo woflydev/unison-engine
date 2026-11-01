@@ -61,6 +61,9 @@ pub struct ProfileItem {
     pub complete: bool,
     /// Your private note on this person.
     pub note: String,
+    pub cosmetics: Option<crate::cosmetics::CosmeticsItem>,
+    /// Profile theme colours (primary, accent) when the person set them.
+    pub theme_colors: Vec<u32>,
 }
 
 impl ProfileItem {
@@ -88,6 +91,8 @@ impl ProfileItem {
             mutual_friend_list: vec![],
             complete: false,
             note: String::new(),
+            cosmetics: None,
+            theme_colors: vec![],
         }
     }
 }
@@ -151,6 +156,8 @@ pub(crate) fn local_profile(s: &Store, user: Id, guild: Option<Id>) -> Option<Pr
         mutual_friend_list: vec![],
         complete: false,
         note: s.notes.get(&user).cloned().unwrap_or_default(),
+        cosmetics: crate::cosmetics::item_of(u),
+        theme_colors: vec![],
     })
 }
 
@@ -176,6 +183,11 @@ pub(crate) fn merge_profile(
         .as_u64()
         .map(|c| c as u32)
         .or_else(|| v["user_profile"]["accent_color"].as_u64().map(|c| c as u32));
+    if let Ok(full) = serde_json::from_value::<unison_core::model::User>(user.clone()) {
+        p.cosmetics = crate::cosmetics::item_of(&full).or(p.cosmetics.take());
+    }
+    let themes = if v["guild_member_profile"]["theme_colors"].is_array() { &v["guild_member_profile"]["theme_colors"] } else { &v["user_profile"]["theme_colors"] };
+    p.theme_colors = themes.as_array().map(|a| a.iter().filter_map(|c| c.as_u64()).map(|c| (c & 0xff_ffff) as u32).take(2).collect()).unwrap_or_default();
     let gp = &v["guild_member_profile"];
     p.pronouns = str_of(&gp["pronouns"]).or_else(|| str_of(&v["user_profile"]["pronouns"]));
     let bio = str_of(&gp["bio"])

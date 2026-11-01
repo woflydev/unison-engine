@@ -39,20 +39,73 @@ impl Default for Comfort {
     }
 }
 
-/// Split free text (commas or new lines) into keywords: trimmed, lowercase, two letters or more,
-/// without duplicates, at most [`MAX_KEYWORDS`].
+/// Longest keyword kept, in characters.
+pub const MAX_KEYWORD_LEN: usize = 32;
+
+/// One word from typed or pasted text: lowercase, without punctuation around it. `None` when
+/// nothing usable is left (under two characters or over [`MAX_KEYWORD_LEN`]).
+fn clean_keyword(raw: &str) -> Option<String> {
+    let w = raw.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    let n = w.chars().count();
+    (2..=MAX_KEYWORD_LEN).contains(&n).then_some(w)
+}
+
+/// Split free text (spaces, commas or new lines) into keywords: lowercase, one word each, two
+/// letters or more, without duplicates, at most [`MAX_KEYWORDS`].
 pub fn normalize_keywords(raw: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for part in raw.split([',', '\n']) {
-        let w = part.trim().to_lowercase();
-        if w.chars().count() >= 2 && !out.contains(&w) {
-            out.push(w);
-        }
-        if out.len() == MAX_KEYWORDS {
-            break;
+    let mut out = Vec::new();
+    add_keywords(&mut out, raw);
+    out
+}
+
+/// What [`add_keywords`] did, for the one line the shell may show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeywordAdd {
+    /// At least one word was added.
+    Added,
+    /// Every word was already in the list.
+    Duplicate,
+    /// Nothing usable (empty, one letter, or longer than [`MAX_KEYWORD_LEN`]).
+    Unusable,
+    /// The list holds [`MAX_KEYWORDS`] already (or filled up before every word fit).
+    Full,
+}
+
+/// Add the words in `raw` to `list` (see [`normalize_keywords`] for what counts as a word).
+pub fn add_keywords(list: &mut Vec<String>, raw: &str) -> KeywordAdd {
+    let (mut added, mut dup, mut full) = (false, false, false);
+    for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let Some(w) = clean_keyword(part) else { continue };
+        if list.contains(&w) {
+            dup = true;
+        } else if list.len() >= MAX_KEYWORDS {
+            full = true;
+        } else {
+            list.push(w);
+            added = true;
         }
     }
-    out
+    match (added, full, dup) {
+        (_, true, _) => KeywordAdd::Full,
+        (true, _, _) => KeywordAdd::Added,
+        (false, _, true) => KeywordAdd::Duplicate,
+        _ => KeywordAdd::Unusable,
+    }
+}
+
+/// The one plain sentence for a refused add (`None` when something was added).
+pub fn keyword_note(r: KeywordAdd) -> Option<&'static str> {
+    match r {
+        KeywordAdd::Added => None,
+        KeywordAdd::Duplicate => Some("Already in the list."),
+        KeywordAdd::Unusable => Some("Use a word of 2 to 32 letters or digits."),
+        KeywordAdd::Full => Some("You can keep up to 20 words."),
+    }
+}
+
+pub fn remove_keyword(list: &mut Vec<String>, word: &str) {
+    let w = word.to_lowercase();
+    list.retain(|k| *k != w);
 }
 
 /// Whether `text` contains any keyword as a whole word (letters and digits delimit words, so
@@ -342,6 +395,30 @@ mod tests {
         assert_eq!(normalize_keywords(&"ab,".repeat(5)).len(), 1);
         let many: String = (0..40).map(|i| format!("word{i},")).collect();
         assert_eq!(normalize_keywords(&many).len(), MAX_KEYWORDS);
+    }
+
+    #[test]
+    fn keyword_editing_rules() {
+        let mut l = vec![];
+        assert_eq!(add_keywords(&mut l, "  Standup! "), KeywordAdd::Added);
+        assert_eq!(l, vec!["standup"]);
+        assert_eq!(add_keywords(&mut l, "STANDUP"), KeywordAdd::Duplicate);
+        assert_eq!(add_keywords(&mut l, "a"), KeywordAdd::Unusable);
+        assert_eq!(add_keywords(&mut l, "   "), KeywordAdd::Unusable);
+        assert_eq!(add_keywords(&mut l, &"x".repeat(33)), KeywordAdd::Unusable);
+        assert_eq!(add_keywords(&mut l, "my name, rust"), KeywordAdd::Added);
+        assert_eq!(l, vec!["standup", "my", "name", "rust"]);
+        remove_keyword(&mut l, "My");
+        assert_eq!(l, vec!["standup", "name", "rust"]);
+        for i in 0..30 {
+            add_keywords(&mut l, &format!("word{i}"));
+        }
+        assert_eq!(l.len(), MAX_KEYWORDS);
+        assert_eq!(add_keywords(&mut l, "another"), KeywordAdd::Full);
+        assert!(keyword_note(KeywordAdd::Added).is_none() && keyword_note(KeywordAdd::Full).is_some());
+        // Whole words and case are the matcher's job, on what is stored.
+        assert!(keyword_hit("Standup at ten", &["standup".into()]));
+        assert!(!keyword_hit("standups", &["standup".into()]));
     }
 
     #[test]

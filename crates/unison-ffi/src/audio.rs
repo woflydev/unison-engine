@@ -3,35 +3,6 @@
 
 use unison_core::voice::params::params;
 
-#[derive(uniffi::Record, Clone, Debug)]
-pub struct AudioSettings {
-    /// Core Audio device ids; 0 is the system default. Read when the audio unit opens (next join).
-    pub input_device: u32,
-    pub output_device: u32,
-    /// 0..=200, percent. Input is also clamped to 100 by the settings pane.
-    pub input_volume: f32,
-    pub output_volume: f32,
-    pub push_to_talk: bool,
-    pub auto_sensitivity: bool,
-    /// dBFS, used when auto sensitivity is off.
-    pub threshold_db: f32,
-    pub echo_cancellation: bool,
-    pub noise_suppression: bool,
-    pub automatic_gain_control: bool,
-}
-
-#[uniffi::export]
-pub fn set_audio_settings(s: AudioSettings) {
-    let p = params();
-    p.set_devices(s.input_device, s.output_device);
-    p.set_input_gain(s.input_volume / 100.0);
-    p.set_output_gain(s.output_volume / 100.0);
-    p.set_input_mode_ptt(s.push_to_talk);
-    p.set_auto_sensitivity(s.auto_sensitivity);
-    p.set_threshold_db(s.threshold_db);
-    p.set_processing(s.echo_cancellation, s.noise_suppression, s.automatic_gain_control);
-}
-
 /// Push-to-talk key state (key down / up), from the shell's hot-key monitor.
 #[uniffi::export]
 pub fn set_push_to_talk_down(down: bool) {

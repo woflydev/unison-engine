@@ -381,7 +381,7 @@ impl UnisonEngine {
         self.with_store(&account_id, |s| {
             s.channels
                 .get(&id(&channel_id))
-                .is_some_and(|c| c.kind != channel_type::GUILD_CATEGORY && c.is_text_like())
+                .is_some_and(|c| c.kind != channel_type::GUILD_CATEGORY && c.has_text_chat())
         })
         .unwrap_or(false)
     }

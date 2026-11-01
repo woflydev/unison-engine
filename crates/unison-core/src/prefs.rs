@@ -86,6 +86,18 @@ pub struct Prefs {
     pub status_created_at_ms: Option<u64>,
     // localization (12)
     pub locale: Option<String>,
+    // text_and_images, more (6)
+    pub view_nsfw_guilds: Option<bool>,
+    pub view_nsfw_commands: Option<bool>,
+    // voice_and_video (5)
+    pub afk_timeout: Option<u32>,
+    pub stream_notifications_enabled: Option<bool>,
+    // privacy, more (8)
+    pub allow_activity_party_friends: Option<bool>,
+    pub allow_activity_party_voice: Option<bool>,
+    pub inappropriate_conversation_warnings: Option<bool>,
+    pub recent_games_enabled: Option<bool>,
+    pub show_local_time: Option<bool>,
 }
 
 // ----- wire helpers -----
@@ -244,6 +256,7 @@ impl Prefs {
         each(blob, |sec, v| {
             let Val::Bytes(b) = v else { return };
             let _ = match sec {
+                5 => each(b, |n, v| p.voice_field(n, v)),
                 6 => each(b, |n, v| p.text_field(n, v)),
                 7 => each(b, |n, v| p.notif_field(n, v)),
                 8 => each(b, |n, v| p.privacy_field(n, v)),
@@ -276,12 +289,22 @@ impl Prefs {
             15 => self.animate_stickers = w(v).map(|x| x as u32),
             17 => self.message_display_compact = w(v).map(|x| x != 0),
             19 => self.explicit_content_filter = w(v).map(|x| x as u32),
+            20 => self.view_nsfw_guilds = w(v).map(|x| x != 0),
+            23 => self.view_nsfw_commands = w(v).map(|x| x != 0),
             21 => self.convert_emoticons = w(v).map(|x| x != 0),
             27 => {
                 if let Val::Varint(x) = v {
                     self.dm_spam_filter_v2 = Some(x as u32)
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn voice_field(&mut self, n: u64, v: Val) {
+        match (n, v) {
+            (6, Val::Bytes(s)) => self.afk_timeout = Some(wrapped_varint(s) as u32),
+            (7, Val::Bytes(s)) => self.stream_notifications_enabled = Some(wrapped_varint(s) != 0),
             _ => {}
         }
     }
@@ -297,7 +320,12 @@ impl Prefs {
 
     fn privacy_field(&mut self, n: u64, v: Val) {
         match (n, v) {
+            (1, Val::Bytes(s)) => self.allow_activity_party_friends = Some(wrapped_varint(s) != 0),
+            (2, Val::Bytes(s)) => self.allow_activity_party_voice = Some(wrapped_varint(s) != 0),
             (4, Val::Varint(x)) => self.default_guilds_restricted = Some(x != 0),
+            (23, Val::Bytes(s)) => self.inappropriate_conversation_warnings = Some(wrapped_varint(s) != 0),
+            (24, Val::Bytes(s)) => self.recent_games_enabled = Some(wrapped_varint(s) != 0),
+            (31, Val::Bytes(s)) => self.show_local_time = Some(wrapped_varint(s) != 0),
             (11, Val::Bytes(s)) => self.friend_source_flags = Some(wrapped_varint(s) as u32),
             (17, Val::Bytes(s)) => self.default_message_request_restricted = Some(wrapped_varint(s) != 0),
             _ => {}
@@ -324,7 +352,9 @@ impl Prefs {
             render_reactions, animate_emoji, animate_stickers, message_display_compact, explicit_content_filter,
             convert_emoticons, dm_spam_filter_v2, show_in_app_notifications, enable_burst_reaction_notifications,
             reaction_notifications, default_guilds_restricted, friend_source_flags, default_message_request_restricted,
-            status, custom_status, show_current_game, status_created_at_ms, locale
+            status, custom_status, show_current_game, status_created_at_ms, locale, view_nsfw_guilds,
+            view_nsfw_commands, afk_timeout, stream_notifications_enabled, allow_activity_party_friends,
+            allow_activity_party_voice, inappropriate_conversation_warnings, recent_games_enabled, show_local_time
         );
     }
 
@@ -333,6 +363,11 @@ impl Prefs {
     pub fn encode_patch(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let flag = |v: bool| v as u64;
+
+        let mut vv = Vec::new();
+        if let Some(v) = self.afk_timeout { put_wrapped_varint(&mut vv, 6, v as u64) }
+        if let Some(v) = self.stream_notifications_enabled { put_wrapped_varint(&mut vv, 7, flag(v)) }
+        if !vv.is_empty() { put_msg(&mut out, 5, &vv) }
 
         let mut t = Vec::new();
         if let Some(v) = self.inline_attachment_media { put_wrapped_varint(&mut t, 9, flag(v)) }
@@ -344,7 +379,9 @@ impl Prefs {
         if let Some(v) = self.animate_stickers { put_wrapped_varint(&mut t, 15, v as u64) }
         if let Some(v) = self.message_display_compact { put_wrapped_varint(&mut t, 17, flag(v)) }
         if let Some(v) = self.explicit_content_filter { put_wrapped_varint(&mut t, 19, v as u64) }
+        if let Some(v) = self.view_nsfw_guilds { put_wrapped_varint(&mut t, 20, flag(v)) }
         if let Some(v) = self.convert_emoticons { put_wrapped_varint(&mut t, 21, flag(v)) }
+        if let Some(v) = self.view_nsfw_commands { put_wrapped_varint(&mut t, 23, flag(v)) }
         if let Some(v) = self.dm_spam_filter_v2 { put_enum(&mut t, 27, v) }
         if !t.is_empty() { put_msg(&mut out, 6, &t) }
 
@@ -361,7 +398,12 @@ impl Prefs {
             put_varint(&mut p, flag(v));
         }
         if let Some(v) = self.friend_source_flags { put_wrapped_varint(&mut p, 11, v as u64) }
+        if let Some(v) = self.allow_activity_party_friends { put_wrapped_varint(&mut p, 1, flag(v)) }
+        if let Some(v) = self.allow_activity_party_voice { put_wrapped_varint(&mut p, 2, flag(v)) }
         if let Some(v) = self.default_message_request_restricted { put_wrapped_varint(&mut p, 17, flag(v)) }
+        if let Some(v) = self.inappropriate_conversation_warnings { put_wrapped_varint(&mut p, 23, flag(v)) }
+        if let Some(v) = self.recent_games_enabled { put_wrapped_varint(&mut p, 24, flag(v)) }
+        if let Some(v) = self.show_local_time { put_wrapped_varint(&mut p, 31, flag(v)) }
         if !p.is_empty() { put_msg(&mut out, 8, &p) }
 
         let mut s = Vec::new();
@@ -469,6 +511,24 @@ mod tests {
         };
         assert_eq!(Prefs::decode(&p.encode_patch()).unwrap(), p);
         assert!(Prefs::default().encode_patch().is_empty());
+    }
+
+    #[test]
+    fn newer_settings_roundtrip() {
+        let p = Prefs {
+            explicit_content_filter: Some(2),
+            view_nsfw_guilds: Some(true),
+            view_nsfw_commands: Some(false),
+            afk_timeout: Some(900),
+            stream_notifications_enabled: Some(true),
+            allow_activity_party_friends: Some(true),
+            allow_activity_party_voice: Some(false),
+            inappropriate_conversation_warnings: Some(true),
+            recent_games_enabled: Some(true),
+            show_local_time: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(Prefs::decode(&p.encode_patch()).unwrap(), p);
     }
 
     #[test]

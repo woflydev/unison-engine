@@ -5,6 +5,7 @@
 
 const PT_SR: u8 = 200;
 const PT_RR: u8 = 201;
+const PT_SDES: u8 = 202;
 const PT_RTPFB: u8 = 205;
 const PT_PSFB: u8 = 206;
 
@@ -281,9 +282,252 @@ pub fn receiver_report(sender: u32, b: &ReportBlock) -> Vec<u8> {
     v
 }
 
+/// Seconds between 1900 and 1970, for NTP timestamps.
+const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+
+/// The 64-bit NTP timestamp (seconds, fraction) of a Unix time in milliseconds.
+pub fn ntp_from_unix_ms(ms: u64) -> (u32, u32) {
+    let secs = ms / 1000 + NTP_UNIX_OFFSET;
+    let frac = (((ms % 1000) << 32) / 1000) as u32;
+    (secs as u32, frac)
+}
+
+/// A sender report with no report blocks (28 bytes): who we are, what time it is, and how much we sent.
+pub fn sender_report(ssrc: u32, unix_ms: u64, rtp_ts: u32, packets: u32, octets: u32) -> Vec<u8> {
+    let (sec, frac) = ntp_from_unix_ms(unix_ms);
+    let mut v = header(0, PT_SR, 6).to_vec();
+    for w in [ssrc, sec, frac, rtp_ts, packets, octets] {
+        v.extend_from_slice(&w.to_be_bytes());
+    }
+    v
+}
+
+/// An SDES packet with one chunk holding the CNAME (item 1), terminated and padded to 32 bits.
+pub fn sdes_cname(ssrc: u32, cname: &str) -> Vec<u8> {
+    let text = &cname.as_bytes()[..cname.len().min(255)];
+    let mut chunk = ssrc.to_be_bytes().to_vec();
+    chunk.push(1);
+    chunk.push(text.len() as u8);
+    chunk.extend_from_slice(text);
+    chunk.push(0);
+    while chunk.len() % 4 != 0 {
+        chunk.push(0);
+    }
+    let mut v = header(1, PT_SDES, chunk.len() / 4).to_vec();
+    v.extend_from_slice(&chunk);
+    v
+}
+
+/// What libwebrtc sends for a stream we are sending: a sender report followed by the SDES CNAME.
+pub fn sender_compound(ssrc: u32, unix_ms: u64, rtp_ts: u32, packets: u32, octets: u32, cname: &str) -> Vec<u8> {
+    let mut v = sender_report(ssrc, unix_ms, rtp_ts, packets, octets);
+    v.extend_from_slice(&sdes_cname(ssrc, cname));
+    v
+}
+
+/// 16 random letters and digits, as libwebrtc's default CNAME.
+pub fn random_cname() -> String {
+    (0..16).map(|_| fastrand::alphanumeric()).collect()
+}
+
+/// Collects arrival times of packets that carry a transport-wide sequence number and writes them
+/// as transport-wide congestion control feedback (the same layout `parse_tcc` reads). Symbols are
+/// written as two-bit status vectors, which is always valid; size matters little at 10 reports a second.
+#[derive(Default)]
+pub struct TccRecorder {
+    media: u32,
+    hi: Option<i64>,
+    seen: std::collections::BTreeMap<i64, i64>,
+    fb_count: u8,
+}
+
+impl TccRecorder {
+    /// Note one packet: its transport-wide sequence number and arrival time in microseconds.
+    pub fn record(&mut self, media_ssrc: u32, seq: u16, arrival_us: i64) {
+        if self.seen.is_empty() {
+            self.media = media_ssrc;
+        }
+        let hi = self.hi.unwrap_or(seq as i64);
+        let ext = hi + seq.wrapping_sub(hi as u16) as i16 as i64;
+        self.hi = Some(hi.max(ext));
+        self.seen.entry(ext).or_insert(arrival_us);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// The feedback packet for everything recorded since the last call; `None` when nothing arrived.
+    pub fn build(&mut self, sender: u32) -> Option<Vec<u8>> {
+        let last = *self.seen.keys().next_back()?;
+        // A report covers at most 8000 sequence numbers: older ones are not worth reporting.
+        let base = (*self.seen.keys().next()?).max(last - 8000);
+        let count = (last - base + 1) as usize;
+        let first_us = *self.seen.range(base..).next()?.1;
+        let reference = first_us.div_euclid(64_000);
+        let mut t_q = reference * 64_000;
+        let mut symbols = Vec::with_capacity(count);
+        let mut deltas: Vec<u8> = Vec::new();
+        for k in 0..count as i64 {
+            match self.seen.get(&(base + k)) {
+                None => symbols.push(0u8),
+                Some(&a) => {
+                    let d = ((a - t_q) as f64 / 250.0).round() as i64;
+                    if (0..=255).contains(&d) {
+                        symbols.push(1);
+                        deltas.push(d as u8);
+                        t_q += d * 250;
+                    } else {
+                        let d = d.clamp(i16::MIN as i64, i16::MAX as i64);
+                        symbols.push(2);
+                        deltas.extend_from_slice(&(d as i16).to_be_bytes());
+                        t_q += d * 250;
+                    }
+                }
+            }
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&(base as u16).to_be_bytes());
+        body.extend_from_slice(&(count as u16).to_be_bytes());
+        body.extend_from_slice(&(((reference & 0xff_ffff) as u32) << 8 | self.fb_count as u32).to_be_bytes());
+        for chunk in symbols.chunks(7) {
+            let mut c = 0xC000u16;
+            for (k, s) in chunk.iter().enumerate() {
+                c |= (*s as u16) << (12 - 2 * k);
+            }
+            body.extend_from_slice(&c.to_be_bytes());
+        }
+        body.extend_from_slice(&deltas);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        let mut v = header(15, PT_RTPFB, (12 + body.len()) / 4 - 1).to_vec();
+        v.extend_from_slice(&sender.to_be_bytes());
+        v.extend_from_slice(&self.media.to_be_bytes());
+        v.extend_from_slice(&body);
+        self.fb_count = self.fb_count.wrapping_add(1);
+        self.seen.clear();
+        Some(v)
+    }
+}
+
+/// Report cadence: libwebrtc's defaults are 1 s for video and 5 s for audio (its
+/// `kDefaultVideoReportInterval` and `kDefaultAudioReportInterval`; an inference, the module's
+/// own values were not decoded). Driven by the caller's clock so it can be tested with a fake one.
+#[derive(Debug, Clone, Copy)]
+pub struct Cadence {
+    interval_ms: u64,
+    next: Option<u64>,
+}
+
+impl Cadence {
+    pub const VIDEO_MS: u64 = 1000;
+    pub const AUDIO_MS: u64 = 5000;
+
+    pub fn new(interval_ms: u64) -> Self {
+        Self { interval_ms, next: None }
+    }
+
+    /// True once per interval; the first call only starts the clock (nothing is sent the instant a
+    /// stream starts).
+    pub fn due(&mut self, now_ms: u64) -> bool {
+        match self.next {
+            None => {
+                self.next = Some(now_ms + self.interval_ms);
+                false
+            }
+            Some(t) if now_ms >= t => {
+                self.next = Some(now_ms + self.interval_ms);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for Cadence {
+    fn default() -> Self {
+        Self::new(Self::VIDEO_MS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_cc_feedback_round_trips_with_losses_and_wrap() {
+        let mut r = TccRecorder::default();
+        // 65534, 65535, (0 lost), 1 across the wrap; the second arrives out of order; one gap of 300 ms.
+        r.record(77, 65535, 1_100_000);
+        r.record(77, 65534, 1_000_000);
+        r.record(77, 1, 1_400_000);
+        let fb = r.build(5).unwrap();
+        assert_eq!(fb.len() % 4, 0);
+        assert_eq!(u16::from_be_bytes([fb[2], fb[3]]) as usize, fb.len() / 4 - 1);
+        let Rtcp::TransportCc(t) = &parse(&fb)[0] else { panic!("not transport-cc") };
+        assert_eq!((t.sender, t.media, t.base_seq, t.fb_count), (5, 77, 65534, 0));
+        let seqs: Vec<u16> = t.arrivals.iter().map(|a| a.0).collect();
+        assert_eq!(seqs, vec![65534, 65535, 0, 1]);
+        let at: Vec<Option<i64>> = t.arrivals.iter().map(|a| a.1).collect();
+        assert_eq!(at, vec![Some(1_000_000), Some(1_100_000), None, Some(1_400_000)]);
+        assert!(r.build(5).is_none(), "nothing new, nothing sent");
+        r.record(77, 2, 1_500_000);
+        let Rtcp::TransportCc(t) = &parse(&r.build(5).unwrap())[0] else { panic!() };
+        assert_eq!((t.fb_count, t.base_seq), (1, 2));
+    }
+
+    #[test]
+    fn sender_report_and_sdes_are_byte_exact() {
+        // 2020-01-01T00:00:00.500Z.
+        let sr = sender_report(0x01020304, 1_577_836_800_500, 0x11223344, 7, 900);
+        assert_eq!(sr.len(), 28);
+        assert_eq!(&sr[..8], &[0x80, 200, 0, 6, 1, 2, 3, 4]);
+        assert_eq!(u32::from_be_bytes(sr[8..12].try_into().unwrap()), 1_577_836_800 + 2_208_988_800);
+        assert_eq!(u32::from_be_bytes(sr[12..16].try_into().unwrap()), 0x8000_0000, "half a second");
+        assert_eq!(&sr[16..28], &[0x11, 0x22, 0x33, 0x44, 0, 0, 0, 7, 0, 0, 3, 0x84]);
+        let sd = sdes_cname(0x01020304, "abcde");
+        assert_eq!(sd, [0x81, 202, 0, 3, 1, 2, 3, 4, 1, 5, b'a', b'b', b'c', b'd', b'e', 0, 0, 0, 0, 0][..sd.len()].to_vec());
+        assert_eq!(sd.len() % 4, 0);
+        assert_eq!(u16::from_be_bytes([sd[2], sd[3]]) as usize * 4 + 4, sd.len());
+        let c = sender_compound(1, 0, 0, 0, 0, "x");
+        assert_eq!(c.len(), 28 + sdes_cname(1, "x").len());
+        // Our own parser takes both halves.
+        assert_eq!(parse(&c).len(), 2);
+    }
+
+    #[test]
+    fn cadence_fires_once_per_interval_on_a_fake_clock() {
+        let mut c = Cadence::new(1000);
+        assert!(!c.due(5000), "starting the clock sends nothing");
+        assert!(!c.due(5999));
+        assert!(c.due(6000));
+        assert!(!c.due(6500));
+        assert!(c.due(8000), "a late tick fires once, not twice");
+        assert!(!c.due(8001));
+        assert_eq!(random_cname().len(), 16);
+    }
+
+    #[test]
+    fn garbage_never_panics_the_parser() {
+        let mut x = 0x1234_5678u32;
+        for n in 0..2000usize {
+            let len = n % 90;
+            let junk: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let _ = parse(&junk);
+            // And a plausible header with random contents behind it.
+            let mut p = vec![0x8f, 205, 0, (len / 4) as u8];
+            p.extend_from_slice(&junk);
+            let _ = parse(&p);
+        }
+    }
 
     #[test]
     fn nack_round_trips_with_gaps_and_wrap() {

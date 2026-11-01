@@ -85,6 +85,9 @@ pub fn voice_state_payload(guild: Option<Id>, channel: Option<Id>, self_mute: bo
         "self_deaf": self_deaf,
         "self_video": false,
         "flags": 0,
+        // A desktop client with video support puts its stream parameters on every voice state
+        // (`voiceStateUpdate`: `tracks` from `getVideoStreamParameters()`, web bundle 2026-10-30).
+        "tracks": [{ "type": "video", "rid": "100", "quality": 100 }],
     })
 }
 
@@ -336,11 +339,11 @@ mod tests {
         use crate::snowflake::Snowflake;
         assert_eq!(
             voice_state_payload(Some(Snowflake(1)), Some(Snowflake(2)), false, true).to_string(),
-            r#"{"guild_id":"1","channel_id":"2","self_mute":false,"self_deaf":true,"self_video":false,"flags":0}"#
+            r#"{"guild_id":"1","channel_id":"2","self_mute":false,"self_deaf":true,"self_video":false,"flags":0,"tracks":[{"type":"video","rid":"100","quality":100}]}"#
         );
         assert_eq!(
             voice_state_payload(Some(Snowflake(1)), None, false, false).to_string(),
-            r#"{"guild_id":"1","channel_id":null,"self_mute":false,"self_deaf":false,"self_video":false,"flags":0}"#
+            r#"{"guild_id":"1","channel_id":null,"self_mute":false,"self_deaf":false,"self_video":false,"flags":0,"tracks":[{"type":"video","rid":"100","quality":100}]}"#
         );
     }
 

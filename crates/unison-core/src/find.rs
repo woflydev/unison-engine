@@ -203,6 +203,16 @@ pub fn score_place(terms: &[String], title_f: &str, context_f: &str) -> Option<i
     Some(total / terms.len() as i32)
 }
 
+/// Added to a place's score when it belongs to the active account: larger than any match tier
+/// plus frecency and unread cues, so other accounts' places only follow all of the active one's.
+pub const ACTIVE_ACCOUNT_FIRST: i32 = 10_000;
+
+/// Orders `items` best first with the active account's before every other account's; within each
+/// group, by `key` descending (a message id or time: newest first). Stable.
+pub fn sort_active_first<T>(items: &mut [T], is_active: impl Fn(&T) -> bool, key: impl Fn(&T) -> u64) {
+    items.sort_by_key(|t| std::cmp::Reverse((is_active(t), key(t))));
+}
+
 // ----- Frecency: recent and frequent places -----
 
 /// One place the person opened, with how often and when.
@@ -480,6 +490,16 @@ mod tests {
         assert!(e.contains("needle") && e.starts_with('…') && e.ends_with('…'));
         assert!(e.chars().count() <= 122);
         assert_eq!(excerpt("short", &terms("short"), 120), "short");
+    }
+
+    #[test]
+    fn active_account_ranks_above_other_accounts() {
+        // An exact title match elsewhere still loses to a loose one in the active account.
+        let (exact, loose) = (match_score("dev", "dev").unwrap() + 110 + 15, match_score("dev", "d e v tools").unwrap_or(FUZZY));
+        assert!(loose + ACTIVE_ACCOUNT_FIRST > exact);
+        let mut m = vec![("b", false, 9), ("a", true, 1), ("c", true, 5), ("d", false, 20)];
+        sort_active_first(&mut m, |t| t.1, |t| t.2);
+        assert_eq!(m.iter().map(|t| t.0).collect::<String>(), "cadb");
     }
 
     #[test]

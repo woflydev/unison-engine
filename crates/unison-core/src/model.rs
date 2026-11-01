@@ -24,6 +24,12 @@ pub struct User {
     pub system: bool,
     pub public_flags: u64,
     pub avatar_decoration_data: Option<Value>,
+    /// Server tag shown next to the name (`identity_guild_id`, `identity_enabled`, `tag`, `badge`).
+    pub primary_guild: Option<Value>,
+    /// Shop items worn on the profile (`nameplate`).
+    pub collectibles: Option<Value>,
+    /// `font_id`, `effect_id`, `colors` of the display name.
+    pub display_name_styles: Option<Value>,
     /// Only present on the current user (READY): shown read-only in settings.
     pub email: Option<String>,
     pub phone: Option<String>,
@@ -193,6 +199,11 @@ impl Channel {
     }
     pub fn is_locked(&self) -> bool {
         self.thread_metadata.as_ref().is_some_and(|m| m["locked"].as_bool() == Some(true))
+    }
+    /// A voice or stage channel has a text chat of its own (same id as the channel): it keeps read
+    /// state, mentions and unread dots like a text channel, but is not a place to sit and read.
+    pub fn has_text_chat(&self) -> bool {
+        self.is_text_like() || matches!(self.kind, channel_type::GUILD_VOICE | channel_type::GUILD_STAGE_VOICE)
     }
     pub fn is_text_like(&self) -> bool {
         matches!(

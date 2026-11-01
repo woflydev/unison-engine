@@ -5,9 +5,9 @@ Rules are in `docs/ARCHITECTURE.md`; this file says where the repo stands agains
 ## 1. Where the code is
 | Layer | Size | Notes |
 |---|---|---|
-| Core (`unison-core`, `-etf`, `-markdown`) | ~16k lines Rust | protocol, store, cache, rules, voice/video engine |
-| Shell API (`unison-ffi`) | ~5k lines Rust | UniFFI records, commands, listener (Swift is generated today; `cdylib` is built, other languages need their UniFFI generator) |
-| macOS shell | ~15k lines Swift | SwiftUI + AppKit |
+| Core (`unison-core`, `-etf`, `-markdown`) | ~30k lines Rust | protocol, store, cache, rules, voice/video engine |
+| Shell API (`unison-ffi`) | ~9k lines Rust | UniFFI records, commands, listener (Swift is generated today; `cdylib` is built, other languages need their UniFFI generator) |
+| macOS shell | ~24k lines Swift | SwiftUI + AppKit |
 
 ## 2. What is ready
 - The workspace has no Apple-only crates except the audio backend, now target-gated: `coreaudio-rs` is a macOS-only dependency and `voice::audio::open` has a stub for other OSes, so `unison-core` should compile elsewhere (Linux: built with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31` and the whole workspace test suite passes on Debian 12 in Docker, see `docs/AUDIT.md`; Windows not yet run).
@@ -25,18 +25,19 @@ Rules are in `docs/ARCHITECTURE.md`; this file says where the repo stands agains
 | 5 | Row height measurement (`RowHeights.swift`) mirrors AppKit text layout | Every shell needs its own measurement; mismatches show as jumpy scrolling | Keep the `heightcheck` approach (compute vs fit) in each shell's DevTools; keep row structure in core data |
 
 ## 4. Architecture debt in the macOS shell
-Rows 1-5 of the first audit are done (see below). What remains:
-
 | # | Where | What | Move to |
 |---|---|---|---|
-| 1 | `Views/Pickers.swift` (masonry column assignment), `ForwardSheet.swift` (search filter) | List shaping | Acceptable as presentation; revisit only if a rule appears |
+| 1 | `Views/Pickers.swift` (masonry columns), `ForwardSheet.swift` (search filter) | List shaping | Acceptable as presentation; revisit only if a rule appears |
 | 2 | `Localizable.xcstrings`; action titles come from the core in English | UI strings live in an Apple catalogue | Decide a shared string source (e.g. JSON in the repo compiled per platform) before translating |
-| 3 | `AppModel.swift` `showMembers`, `density`, `useDiscordTheme`, `nativeVoice` | UI-only prefs | Fine in the shell. `nativeVoice` is a feature flag: move to a core flag if other shells share it |
-| 4 | Voice settings (`voice.*` in `UserDefaults`, pushed by `VoiceAudio`) | Input/output device, volumes, PTT, sensitivity | Device ids are per-OS; the rest could move to the core `LocalState` |
+| 3 | `AppModel.swift` `showMembers`, `density`, `useDiscordTheme` | UI-only prefs | Fine in the shell |
+| 4 | Voice device ids (`voice.inputDevice`, `voice.outputDevice`) and the push-to-talk key (`voice.pttKeyCode`) in `UserDefaults` | Device ids and key codes differ per OS | Fine in the shell. Volumes, input mode, sensitivity and processing are the core's (`voice_prefs`) |
 | 5 | `DevTools.swift`, `scripts/perf`, packaging scripts | macOS-only tooling | Per-platform by nature; keep the budgets shared |
-| 6 | `Release.swift` update-check timing (`UserDefaults` last check) | Behavioural persistence in the shell | Core `kv` + `update_check_due`; also the `update.beta` channel switch (`Update.swift`) |
-| 7 | `UpdateInstaller.swift`, `update-swap.sh` | Mount, copy, codesign, swap and relaunch are OS work | Per-platform by nature; the rules are in `update_install.rs` |
-| 8 | `AppModel.sidebarOpen`, `sidebarColumnWidth`, `Dock` and `ChatTitle` (`RootView.swift`, `DesignSystem.swift`) | Pane open/closed and width are UI-only prefs; the dock and title layout are window chrome; the title's trailing reserve and leading clearance are constants for the macOS toolbar | Fine in the shell; another shell draws its own chrome. Keep the rule (one owned width, interruptible, chat follows the live edge) |
+| 6 | `UpdateInstaller.swift`, `update-swap.sh` | Mount, copy, codesign, swap and relaunch are OS work | Per-platform by nature; the rules are in `update_install.rs` |
+| 7 | `AppModel.sidebarOpen`, `sidebarColumnWidth`, `Dock` and `ChatTitle` (`RootView.swift`, `DesignSystem.swift`) | Pane open/closed and width are UI-only prefs; dock and title layout are window chrome with macOS toolbar constants | Fine in the shell; another shell draws its own chrome. Keep the rule (one owned width, interruptible, chat follows the live edge) |
+| 8 | Menu accelerators in `UnisonApp.swift` | The shortcut list is the core's (`keybinds.rs`, `keybind_table`), the binding to menu items is the shell's | Another shell translates `mod+shift+i` tokens to its modifier keys; custom bindings are not offered |
+| 9 | `Views/Cosmetics.swift`, `Views/LottieSticker.swift` | Drawing only: the core parses and decides (`cosmetics.rs`, `sticker_motion.rs`) | Fine; Lottie needs a player (`lottie-ios`; web has lottie-web) |
+
+Fixed on 2026-11-01: update-check timing and the beta channel (`UpdatePrefs`, `update_check_due`), the native-calls switch and the call choices (`VoicePrefs`), the zstd advisories (`third_party/wreq-util` moves zstd to 0.14 / zstd-safe 8).
 
 Update and restart (what another shell implements). The core owns every rule and sentence (`update.rs`, `update_install.rs`, `unison-ffi/src/release.rs`); a shell supplies only the OS half:
 1. Fetch the feed at `update_feed_url(base, channel)`, pass the body to `verify_appcast(json, version, build, UpdatePlatform{os, arch, os_version}, channel)`; it returns the asset for this OS and CPU (`macos`/`windows`/`linux`, `arm64`/`x86_64`) or nothing. Add the platform's assets to the feed (`assets[]`, see `docs/RELEASING.md`).
@@ -45,7 +46,7 @@ Update and restart (what another shell implements). The core owns every rule and
 4. Unpack/mount the download, copy the new app next to the installed one (same volume, so the swap is a rename), verify its code signature with the OS tool, read its `CodeIdentity` (identifier, version, signer; the running app's too) and call `update_check_candidate`; refuse with the returned sentence on error.
 5. `update_restart_gate(in_call)`: never restart during a call; keep `ReadyToRestart` and let the person press Restart Now afterwards. Restart only from a click.
 6. Hand off to a detached helper that outlives the app: wait for the app's pid to exit, move the old app aside, move the new one in, start it, confirm it runs, then delete the old one; on any failure put the old one back and start it. macOS: `apps/macos/Resources/update-swap.sh` (tested by `scripts/test-update-swap.sh`). Windows will need a helper process (the exe cannot replace itself while running; the same wait, swap, start, confirm, roll back sequence), Linux an AppImage/package-aware equivalent.
-The update channel and auto-check preferences are still shell `UserDefaults` (row 6 above).
+The update channel, auto-check switch and last-check time are core preferences (`updater_prefs`, `update_check_due`, `record_update_check`).
 
 Moved to the core (done):
 - Navigation history, remembered/last channel (was `UserDefaults`), channel/server stepping: `navstate.rs`, `shell_nav.rs`.

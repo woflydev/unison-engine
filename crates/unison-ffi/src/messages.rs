@@ -205,6 +205,9 @@ pub struct MessageItem {
     pub grouped: bool,
     /// The user may add reactions here (drives the "add reaction" chip).
     pub can_react: bool,
+    pub author_cosmetics: Option<crate::cosmetics::CosmeticsItem>,
+    /// Icon of the author's highest role that has one, drawn beside the name.
+    pub role_icon_url: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Debug)]
@@ -222,6 +225,7 @@ pub enum MemberRow {
         is_bot: bool,
         /// Custom status or main activity, drawn under the name.
         activity: Option<presence::ActivityItem>,
+        cosmetics: Option<crate::cosmetics::CosmeticsItem>,
     },
 }
 
@@ -236,6 +240,11 @@ pub struct FileUpload {
     /// Alt text.
     #[uniffi(default = None)]
     pub description: Option<String>,
+    /// A voice message: its length in seconds and base64 waveform (from `VoiceNoteRecorder`).
+    #[uniffi(default = None)]
+    pub voice_secs: Option<f64>,
+    #[uniffi(default = None)]
+    pub voice_waveform: Option<String>,
 }
 
 impl FileUpload {
@@ -246,6 +255,7 @@ impl FileUpload {
             bytes: unison_core::Bytes::from(self.bytes),
             description: self.description,
             spoiler: self.spoiler,
+            voice: self.voice_secs.zip(self.voice_waveform).map(|(duration_secs, waveform)| unison_core::rest::VoiceMeta { duration_secs, waveform }),
         }
     }
 }
@@ -258,6 +268,12 @@ pub(crate) fn location(s: &Store, channel: Id) -> String {
         Some(g) => format!("{} · #{}", g.name(), c.name.as_deref().unwrap_or("")),
         None => dm_item(s, c).name,
     }
+}
+
+/// The server a channel's messages belong to, for naming people and roles in a message that came
+/// without one (REST pages carry no server id). `hint` is what the surface itself knew.
+pub(crate) fn guild_of_channel(s: &Store, channel: Id, hint: Option<Id>) -> Option<Id> {
+    hint.or_else(|| s.channels.get(&channel).and_then(|c| unison_core::open_target::guild_of(s, c)))
 }
 
 pub(crate) struct StoreResolver<'a> {
@@ -275,10 +291,12 @@ impl Resolve for StoreResolver<'_> {
         .then(|| self.s.display_name(self.guild, u))
     }
     fn role(&self, rid: &str) -> Option<String> {
-        self.s
-            .roles
-            .get(&self.guild?)?
-            .get(&id(rid))
+        let r = id(rid);
+        // A message fetched over REST (Inbox, search, saved) carries no server id, so the server
+        // may be unknown; role ids are unique across servers, so look in all of them.
+        self.guild
+            .and_then(|g| self.s.roles.get(&g)?.get(&r))
+            .or_else(|| self.s.roles.values().find_map(|m| m.get(&r)))
             .map(|r| r.name.clone())
     }
     fn channel(&self, cid: &str) -> Option<String> {
@@ -501,6 +519,8 @@ pub(crate) fn message_item(s: &Store, guild: Option<Id>, m: &Message) -> Message
         author_id: m.author.id.to_string(),
         author_name: s.display_name(guild, m.author.id),
         author_color: s.name_color(guild, m.author.id),
+        author_cosmetics: crate::cosmetics::item_of(&m.author),
+        role_icon_url: unison_core::cosmetics::role_icon_url(s, guild, m.author.id),
         avatar_url: avatar,
         is_bot: m.author.bot,
         timestamp_ms: if m.id.0 == 0 {
@@ -795,6 +815,7 @@ impl UnisonEngine {
                         ..Default::default()
                     });
                     Some(MemberRow::Member {
+                        cosmetics: crate::cosmetics::item_of(m.member.user.as_ref().unwrap_or(&user)),
                         user_id: uid.to_string(),
                         name: m
                             .member
@@ -1074,5 +1095,21 @@ mod bench {
             total += d; worst = worst.max(d); n += 1;
         }
         eprintln!("{n} channels: mean {:?}, worst {:?} per 50-message build", total / n.max(1), worst);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use unison_core::model::Role;
+    use unison_core::snowflake::Snowflake;
+
+    #[test]
+    fn a_role_is_named_even_when_the_message_has_no_server() {
+        let mut s = Store::default();
+        s.roles.entry(Snowflake(100)).or_default().insert(Snowflake(5), Role { id: Snowflake(5), name: "Mods".into(), ..Default::default() });
+        assert_eq!(preview_text(&s, None, "ping <@&5> now", 80), "ping @Mods now", "Inbox, search and saved messages carry no server id");
+        assert_eq!(preview_text(&s, Some(Snowflake(100)), "ping <@&5>", 80), "ping @Mods");
+        assert_eq!(preview_text(&s, None, "<@&9>", 80), "@deleted-role", "a role that really is gone");
     }
 }

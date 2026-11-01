@@ -60,7 +60,7 @@ impl UnisonEngine {
             .map(|mut s| {
                 // Stored as the message said it (raw mentions): shown with names, resolved now so a
                 // renamed role or a newly known member reads right, and old entries are fixed too.
-                if let Some(p) = self.with_store(&s.account.to_string(), |st| messages::preview_text(st, s.guild, &s.snippet, 200)) {
+                if let Some(p) = self.with_store(&s.account.to_string(), |st| messages::preview_text(st, messages::guild_of_channel(st, s.channel, s.guild), &s.snippet, 200)) {
                     s.snippet = p;
                 }
                 item(s, now)

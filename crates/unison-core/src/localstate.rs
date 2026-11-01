@@ -14,6 +14,17 @@ use crate::Result;
 
 const RECENT_MAX: usize = 24;
 
+/// What each search-history level allows per account: room on disk in bytes (0: no limit) and
+/// messages kept for each channel. Messages are stored compressed, so Standard holds roughly
+/// 200,000 of them.
+pub fn index_limits(level: u8) -> (u64, i64) {
+    match level {
+        0 => (200 << 20, 500),
+        1 => (1 << 30, 2000),
+        _ => (0, 10_000),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecentReaction {
     /// Unicode emoji, or `name:id` for a custom one.
@@ -27,6 +38,48 @@ pub struct UserVoice {
     /// Percent, 0..=200.
     pub volume: f32,
     pub muted: bool,
+}
+
+/// Calls, the parts that are not device-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoicePrefs {
+    /// Percent; the input slider stops at 100.
+    pub input_volume: f32,
+    pub output_volume: f32,
+    pub push_to_talk: bool,
+    pub auto_sensitivity: bool,
+    /// dBFS, used when auto sensitivity is off.
+    pub threshold_db: f32,
+    pub echo_cancellation: bool,
+    pub noise_suppression: bool,
+    pub automatic_gain_control: bool,
+}
+
+impl Default for VoicePrefs {
+    fn default() -> Self {
+        Self {
+            input_volume: 100.0,
+            output_volume: 100.0,
+            push_to_talk: false,
+            auto_sensitivity: true,
+            threshold_db: -50.0,
+            echo_cancellation: true,
+            noise_suppression: true,
+            automatic_gain_control: true,
+        }
+    }
+}
+
+impl VoicePrefs {
+    pub fn clamped(&self) -> Self {
+        Self {
+            input_volume: self.input_volume.clamp(0.0, 100.0),
+            output_volume: self.output_volume.clamp(0.0, 200.0),
+            threshold_db: self.threshold_db.clamp(-80.0, -20.0),
+            ..*self
+        }
+    }
 }
 
 #[derive(Default)]
@@ -184,12 +237,43 @@ impl LocalState {
         self.put("comfort", c);
     }
 
+    /// The welcome guide was shown (or is not for this person); see `welcome.rs`.
+    pub fn welcome_seen(&self) -> u32 {
+        self.get("welcome_rev").unwrap_or(0)
+    }
+
+    /// Record the current revision as seen and clear any replay request.
+    pub fn set_welcome_seen(&self) {
+        self.put("welcome_rev", &crate::welcome::REVISION);
+        self.put("welcome_replay", &false);
+    }
+
+    pub fn welcome_replay(&self) -> bool {
+        self.get("welcome_replay").unwrap_or(false)
+    }
+
+    /// Settings asked to see the guide again: it plays on the next launch.
+    pub fn request_welcome_replay(&self) {
+        self.put("welcome_replay", &true);
+    }
+
     pub fn reply_ping(&self) -> bool {
         self.get("reply_ping").unwrap_or(true)
     }
 
     pub fn set_reply_ping(&self, on: bool) {
         self.put("reply_ping", &on);
+    }
+
+    // ----- Search history (the on-device message index) -----
+
+    /// 0 Standard, 1 Large, 2 Unlimited.
+    pub fn index_level(&self) -> u8 {
+        self.get::<u8>("index_level").unwrap_or(0).min(2)
+    }
+
+    pub fn set_index_level(&self, level: u8) {
+        self.put("index_level", &level.min(2));
     }
 
     // ----- Calls -----
@@ -207,6 +291,35 @@ impl LocalState {
             all.insert(user.to_string(), v);
         }
         self.put("user_voice", &all);
+    }
+
+    /// Volumes, input mode and processing for calls (devices and the push-to-talk key are per-OS, so the shell keeps them).
+    pub fn voice_prefs(&self) -> VoicePrefs {
+        self.get("voice_prefs").unwrap_or_default()
+    }
+
+    pub fn set_voice_prefs(&self, p: &VoicePrefs) {
+        self.put("voice_prefs", &p.clamped());
+    }
+
+    /// Use native calls (otherwise Discord's web view).
+    pub fn native_voice(&self) -> bool {
+        self.get("native_voice").unwrap_or(true)
+    }
+
+    pub fn set_native_voice(&self, on: bool) {
+        self.put("native_voice", &on);
+    }
+
+    // ----- Updates -----
+
+    /// Update checks at launch (on unless the person turned them off) and the beta channel (off).
+    pub fn update_prefs(&self) -> crate::update::UpdatePrefs {
+        self.get("update_prefs").unwrap_or_default()
+    }
+
+    pub fn set_update_prefs(&self, p: &crate::update::UpdatePrefs) {
+        self.put("update_prefs", p);
     }
 
     // ----- Accounts -----

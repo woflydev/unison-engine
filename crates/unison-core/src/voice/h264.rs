@@ -148,6 +148,15 @@ pub fn rtp_header(pt: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32) -> 
     h
 }
 
+/// RTP header for video with the extension block of [`crate::voice::rtp::video_extension_block`]:
+/// 12 + 4 bytes authenticated, then the 8-byte extension body (sealed with the payload).
+pub fn rtp_header_ext(pt: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32, now_ms: u64, transport_seq: u16) -> Vec<u8> {
+    let mut h = rtp_header(pt, marker, seq, timestamp, ssrc).to_vec();
+    h[0] |= 0x10;
+    h.extend_from_slice(&crate::voice::rtp::video_extension_block(now_ms, transport_seq));
+    h
+}
+
 pub fn marker(packet: &[u8]) -> bool {
     packet.get(1).is_some_and(|b| b & 0x80 != 0)
 }

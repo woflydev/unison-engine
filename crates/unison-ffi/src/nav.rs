@@ -272,8 +272,8 @@ impl UnisonEngine {
                         message_id: m.id.to_string(),
                         author: m.author.display_name().to_string(),
                         avatar_url: m.author.avatar_url(64),
-                        content: messages::preview_text(&st, m.guild_id, &m.content, 400),
-                        rich: messages::rich(&st, m.guild_id, &m.content),
+                        content: messages::preview_text(&st, messages::guild_of_channel(&st, m.channel_id, m.guild_id), &m.content, 400),
+                        rich: messages::rich(&st, messages::guild_of_channel(&st, m.channel_id, m.guild_id), &m.content),
                         location: messages::location(&st, m.channel_id),
                         timestamp_ms: m.id.timestamp_ms(),
                     })

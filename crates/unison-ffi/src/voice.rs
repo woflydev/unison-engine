@@ -218,6 +218,10 @@ impl UnisonEngine {
         };
         let intent = gesture.intent();
         let _guard = self.inner.rt.enter();
+        // The call connection takes its video sinks when it connects; without them incoming
+        // camera frames and keyframe/bitrate requests are dropped.
+        self.ensure_video_hooks(&account_id);
+        self.inner.leave_other_calls(id(&account_id));
         if let Err(e) = s.join_voice(intent, id(&guild_id), id(&channel_id)) {
             self.listener.on_error(account_id, e.user_message());
         }
@@ -230,6 +234,10 @@ impl UnisonEngine {
         };
         let intent = gesture.intent();
         let _guard = self.inner.rt.enter();
+        // The call connection takes its video sinks when it connects; without them incoming
+        // camera frames and keyframe/bitrate requests are dropped.
+        self.ensure_video_hooks(&account_id);
+        self.inner.leave_other_calls(id(&account_id));
         if let Err(e) = s.start_dm_call(intent, id(&channel_id)) {
             self.listener.on_error(account_id, e.user_message());
         }
@@ -242,6 +250,10 @@ impl UnisonEngine {
         };
         let intent = gesture.intent();
         let _guard = self.inner.rt.enter();
+        // The call connection takes its video sinks when it connects; without them incoming
+        // camera frames and keyframe/bitrate requests are dropped.
+        self.ensure_video_hooks(&account_id);
+        self.inner.leave_other_calls(id(&account_id));
         if let Err(e) = s.join_dm_call(intent, id(&channel_id)) {
             self.listener.on_error(account_id, e.user_message());
         }
@@ -330,7 +342,7 @@ impl UnisonEngine {
         let (l1, l2) = (self.listener.clone(), self.listener.clone());
         let (a1, a2) = (account_id.to_string(), account_id.to_string());
         s.set_video_hooks(VideoHooks {
-            frames: Arc::new(move |stream, f| l1.on_remote_video(a1.clone(), stream.to_string(), f.user.to_string(), f.annexb, f.keyframe, f.pts)),
+            frames: Arc::new(move |stream, f| l1.on_remote_video(a1.clone(), stream.to_string(), f.user.to_string(), f.annexb, f.keyframe, f.pts, f.rotation)),
             control: Arc::new(move |source, c| {
                 let (kind, value) = match c {
                     VideoControl::Keyframe => (VideoControlKind::Keyframe, 0),
@@ -339,6 +351,21 @@ impl UnisonEngine {
                 l2.on_video_control(a2.clone(), source.to_string(), kind, value)
             }),
         });
+    }
+
+    /// A remote video tile is shown again after it stopped decoding while hidden: ask its sender
+    /// for a keyframe so the picture comes back at once instead of staying black.
+    pub fn request_video_keyframe(&self, account_id: String, stream: String, user_id: String) {
+        if let Some(s) = self.inner.session(id(&account_id)) {
+            s.request_video_keyframe(&stream, id(&user_id));
+        }
+    }
+
+    /// The app's display of one remote video, about once a second: frames handed to the decoder,
+    /// put on screen, skipped (hidden, waiting for a keyframe) and decoder failures. Logged next
+    /// to `video rx` so a stutter can be placed on the network or the display.
+    pub fn video_display_stats(&self, stream: String, user_id: String, pushed: u32, shown: u32, skipped: u32, failed: u32) {
+        tracing::debug!(target: "unison_core::voice", stream, user = user_id, pushed, shown, skipped, failed, "video display, last 1 s");
     }
 
     /// Start Go Live in the call. The capture picker and encoder start on the Swift side; frames
@@ -377,6 +404,7 @@ impl UnisonEngine {
         self.ensure_video_hooks(&account_id);
         let Some(s) = self.inner.session(id(&account_id)) else { return };
         if let Err(e) = s.set_camera(gesture.intent(), on, VideoWant { kind: "video", width, height, fps }) {
+            tracing::debug!(target: "unison_core::voice", error = %e.user_message(), "camera toggle refused");
             self.listener.on_error(account_id, e.user_message());
         }
     }

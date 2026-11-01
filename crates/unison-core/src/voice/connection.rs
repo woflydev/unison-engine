@@ -28,6 +28,7 @@ use crate::voice::crypto::{self, Transport as Aead};
 use crate::voice::dave::{self, Dave, Out};
 use crate::voice::protocol::{self, op};
 use crate::voice::rtp;
+use crate::voice::recv;
 use crate::voice::stream::{self, Media, RemoteStream, Role, VideoIo, VideoState, VideoWant};
 
 /// What the session needs to open a connection (from VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE).
@@ -88,6 +89,9 @@ struct Shared {
     users: Mutex<HashMap<u32, u64>>,
     video: VideoState,
     role: Role,
+    /// Users whose incoming video the app wants a fresh keyframe of (a tile shown again after it
+    /// was hidden and stopped decoding). The receive loop turns each into a PLI.
+    keyframe_wanted: Mutex<Vec<u64>>,
 }
 
 pub struct VoiceHandle {
@@ -96,6 +100,12 @@ pub struct VoiceHandle {
 }
 
 impl VoiceHandle {
+    /// Ask `user`'s sender for a keyframe (PLI), and drop their P frames until it comes: the app
+    /// stopped decoding while the tile was hidden, so it has no reference to decode them against.
+    pub fn request_keyframe(&self, user: u64) {
+        self.shared.keyframe_wanted.lock().push(user);
+    }
+
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::Relaxed);
     }
@@ -121,11 +131,13 @@ impl VoiceHandle {
     /// One encoded access unit (Annex B) from the app's hardware encoder.
     pub fn push_video(&self, annexb: &[u8], pts_90k: u32) {
         if !self.shared.video.sending() {
+            self.shared.video.note_idle();
             return;
         }
         let enc = self.shared.dave.lock().encrypt_video(annexb).map(|c| c.into_owned());
-        if let Some(f) = enc {
-            self.shared.video.push(&f, pts_90k);
+        match enc {
+            Some(f) => self.shared.video.push(&f, pts_90k),
+            None => self.shared.video.note_dave_refused(),
         }
     }
 
@@ -157,6 +169,7 @@ pub fn spawn(p: Params, transport: Arc<Transport>, identity: Arc<ClientIdentity>
         users: Mutex::new(HashMap::new()),
         video: VideoState::default(),
         role: p.role,
+        keyframe_wanted: Mutex::new(Vec::new()),
     });
     let (tx, rx) = mpsc::unbounded_channel();
     let s = shared.clone();
@@ -199,7 +212,7 @@ async fn run(
             Exit::Shutdown | Exit::Fatal => break,
             Exit::Resume => {
                 failures += 1;
-                if failures > 5 {
+                if failures > 3 {
                     break;
                 }
                 // Backoff 1 s → 5 s, as the control socket's.
@@ -244,6 +257,7 @@ async fn once(
             session_id: &p.session_id,
             token: &p.token,
             max_dave_protocol_version: dave::MAX_VERSION,
+            screen: p.role != Role::Call,
         })
     };
     if ws.send(WsMessage::Text(hello.to_string().into())).await.is_err() {
@@ -274,7 +288,7 @@ async fn once(
                 }
                 acked = false;
                 sent_at = Some(std::time::Instant::now());
-                send.push(Out::Json(protocol::heartbeat(now_ms(), conn.seq_ack)));
+                send.push(Out::Json(protocol::heartbeat(now_ms(), conn.seq_ack, conn.server_version)));
             }
             Some(v) = out_rx.recv() => send.push(Out::Json(v)),
             msg = ws.recv() => {
@@ -318,7 +332,7 @@ async fn once(
                                 let Some((sock, addr, local_port)) = found else { return Exit::Resume };
                                 conn.socket = Some(sock);
                                 let rtc_connection_id = uuid::Uuid::new_v4().to_string();
-                                send.push(Out::Json(protocol::select_protocol(&addr, local_port, mode, &rtc_connection_id, &conn.experiments)));
+                                send.push(Out::Json(protocol::select_protocol(&addr, local_port, mode, &rtc_connection_id, &protocol::client_experiments())));
                             }
                             op::SESSION_DESCRIPTION => {
                                 let d: protocol::SessionDescription = serde_json::from_value(f.d).unwrap_or_default();
@@ -346,12 +360,19 @@ async fn once(
                                             users.insert(ss as u32, u);
                                         }
                                     }
+                                    let pair = |media: Option<u64>, rtx: Option<u64>| {
+                                        if let (Some(m), Some(x)) = (media.filter(|s| *s != 0), rtx.filter(|s| *s != 0)) {
+                                            shared.video.rtx_of.lock().insert(x as u32, m as u32);
+                                        }
+                                    };
+                                    pair(f.d["video_ssrc"].as_u64(), f.d["rtx_ssrc"].as_u64());
                                     for st in f.d["streams"].as_array().into_iter().flatten() {
                                         for k in ["ssrc", "rtx_ssrc"] {
                                             if let Some(ss) = st[k].as_u64().filter(|s| *s != 0) {
                                                 users.insert(ss as u32, u);
                                             }
                                         }
+                                        pair(st["ssrc"].as_u64(), st["rtx_ssrc"].as_u64());
                                     }
                                     shared.dave.lock().clients_connect([u]);
                                 }
@@ -405,8 +426,9 @@ async fn once(
                     }
                     WsMessage::Close(frame) => {
                         let code: u16 = frame.map(|f| f.code.into()).unwrap_or(1006);
-                        // 4004 auth, 4006 session gone, 4014 kicked or channel deleted: don't resume.
-                        return if matches!(code, 4004 | 4006 | 4011 | 4014 | 4016) { Exit::Fatal } else { Exit::Resume };
+                        // 4004 auth, 4006 session gone, 4011 server not found, 4015 server crashed (the official client
+                        // stops on these four), 4014 kicked or channel deleted: don't resume.
+                        return if matches!(code, 4004 | 4006 | 4011 | 4014 | 4015 | 4016) { Exit::Fatal } else { Exit::Resume };
                     }
                     _ => {}
                 }
@@ -466,7 +488,8 @@ fn start_media(
         return false;
     };
     let seal = Arc::new(Mutex::new(seal));
-    let media = Arc::new(Media { sock: tx_sock, seal: seal.clone() });
+    let cname = crate::voice::rtcp::random_cname();
+    let media = Arc::new(Media { sock: tx_sock, seal: seal.clone(), cname: cname.clone() });
     shared.video.attach(media, out.clone(), video_io);
     let role = p.role;
     let (mixer, feeds) = audio::mixer(shared.controls.clone());
@@ -499,7 +522,7 @@ fn start_media(
                     return;
                 }
             };
-            send_loop(sock, seal, capture, ssrc, me, bitrate, &shared, &emit, &out);
+            send_loop(sock, seal, cname, capture, ssrc, me, bitrate, &shared, &emit, &out);
             drop(device);
         })
         .is_ok()
@@ -515,12 +538,16 @@ fn set_realtime_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_realtime_qos() {}
 
-const SILENCE_FRAMES: u32 = 5;
+/// Silence frames sent after speech: `AudioTransport::ShouldSendSilence` in `discord_voice.node` stops
+/// at a counter of 10 (`cmp w8, #9; b.gt`), each one the last packet's header and extension block
+/// with `F8 FF FE` as payload (`discord::SilencePacket`).
+const SILENCE_FRAMES: u32 = 10;
 
 #[allow(clippy::too_many_arguments)]
 fn send_loop(
     sock: UdpSocket,
     seal: Arc<Mutex<Aead>>,
+    cname: String,
     mut capture: audio::Capture,
     ssrc: u32,
     me: Id,
@@ -537,6 +564,11 @@ fn send_loop(
     let (mut speaking, mut silence) = (false, 0u32);
     let pr = params::params();
     let mut gate = params::Gate::default();
+    let mut speaking_gate = protocol::SpeakingGate::default();
+    // Sender report cadence and counters for our audio stream (every 5 s while we send).
+    let mut sr_clock = crate::voice::rtcp::Cadence::new(crate::voice::rtcp::Cadence::AUDIO_MS);
+    let mut stats = crate::voice::video::SenderStats::default();
+    tracing::debug!(target: "unison_core::voice", ids = "audio-level 1, abs-send-time 3", "audio rtp extensions in use");
     while !shared.stop.load(Ordering::Relaxed) {
         thread::park_timeout(Duration::from_millis(100));
         while capture.frame(&mut mono) {
@@ -549,11 +581,15 @@ fn send_loop(
                     *s = (*s * gain).clamp(-1.0, 1.0);
                 }
             }
-            let voice_now = pr.gate(&mut gate, audio::level_db(&mono));
+            let level_db = audio::level_db(&mono);
+            let voice_now = pr.gate(&mut gate, level_db);
             let voice = !muted && voice_now;
             if voice != speaking {
                 speaking = voice;
-                let _ = out.send(protocol::speaking(if voice { protocol::SPEAKING_VOICE } else { 0 }, ssrc));
+                let status = if voice { protocol::SPEAKING_VOICE } else { 0 };
+                if speaking_gate.should_send(status, ssrc) {
+                    let _ = out.send(protocol::speaking(status, ssrc));
+                }
                 emit(VoiceEvent::Speaking { user: me, speaking: voice });
                 if !voice {
                     silence = SILENCE_FRAMES;
@@ -573,11 +609,25 @@ fn send_loop(
                 None
             };
             if let Some(payload) = frame {
-                let sealed = seal.lock().seal(&rtp::header(seq, ts, ssrc), &payload);
+                // Audio carries the audio-level and abs-send-time extensions like the official client; the
+                // extension body is sealed in front of the payload.
+                let (hdr, ext) = rtp::audio_header_with_extensions(seq, ts, ssrc, level_db, voice, now_ms());
+                let sealed = seal.lock().seal(&hdr, &[&ext[..], &payload[..]].concat());
                 if let Some(pkt) = sealed {
                     let _ = sock.send(&pkt);
                 }
                 seq = seq.wrapping_add(1);
+                stats.on_packet(payload.len(), ts, now_ms());
+                let now = now_ms();
+                if sr_clock.due(now) {
+                    let sr = crate::voice::rtcp::sender_compound(ssrc, now, stats.rtp_ts_at(now, 48), stats.packets, stats.octets, &cname);
+                    if sr.len() > 8 {
+                        if let Some(p) = seal.lock().seal(&sr[..8], &sr[8..]) {
+                            let _ = sock.send(&p);
+                            tracing::debug!(target: "unison_core::voice", packets = stats.packets, "rtcp sender report sent (audio)");
+                        }
+                    }
+                }
             }
         }
     }
@@ -593,29 +643,84 @@ struct Stream {
 }
 
 fn receive(sock: UdpSocket, open: Aead, mut feeds: Option<Feeds>, shared: Arc<Shared>, emit: Emit) {
-    let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+    use crate::voice::rtcp::{Rtcp, TccRecorder};
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
     let mut streams: HashMap<u32, Stream> = HashMap::new();
     let mut remote: HashMap<u32, RemoteStream> = HashMap::new();
     let mut buf = vec![0u8; 2048];
     let mut pcm = vec![0f32; FRAME * codec::CHANNELS];
     let mut next_slot = 0usize;
+    let started = Instant::now();
+    let mut tcc = TccRecorder::default();
+    let mut tcc_clock = crate::voice::rtcp::Cadence::new(100);
+    let mut report_clock = crate::voice::rtcp::Cadence::new(1000);
+    let mut tcc_logged = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let n = sock.recv(&mut buf).unwrap_or(0);
         let now = Instant::now();
+        let now_ms = now_ms();
         if n > 0 && rtp::is_rtcp(&buf[..n]) {
             if let Some(plain) = stream::open_rtcp(&open, &buf[..n]) {
-                shared.video.on_rtcp(now_ms(), &crate::voice::rtcp::parse(&plain));
+                let parsed = crate::voice::rtcp::parse(&plain);
+                for p in &parsed {
+                    if let Rtcp::SenderReport { ssrc, ntp, .. } = p {
+                        if let Some(rs) = remote.get_mut(ssrc) {
+                            rs.stats.on_sender_report(*ntp, now_ms);
+                        }
+                    }
+                }
+                shared.video.on_rtcp(now_ms, &parsed);
             }
         } else if n > 0 {
             if let Some(h) = rtp::parse(&buf[..n]) {
-                if h.payload_type == stream::H264_PT {
-                    receive_video(&open, &buf[..n], &h, &shared, &mut remote, now);
-                } else if h.payload_type == rtp::OPUS_PT {
-                    if let Some(feeds) = feeds.as_mut() {
-                        receive_audio(&open, &buf[..n], &h, &shared, &emit, feeds, &mut streams, &mut pcm, &mut next_slot, now);
+                if let Some((ext, mut payload)) = open.open_parts(&buf[..n], &h) {
+                    if let Some(seq) = rtp::transport_seq(&ext) {
+                        if !tcc_logged {
+                            tcc_logged = true;
+                            tracing::debug!(target: "unison_core::voice", "incoming packets carry the transport-wide sequence number; sending transport-cc feedback");
+                        }
+                        tcc.record(h.ssrc, seq, now.duration_since(started).as_micros() as i64);
+                    }
+                    let marker = buf[1] & 0x80 != 0;
+                    if !rtp::strip_padding(&mut payload, h.padded) {
+                        // Padding-only (a bandwidth probe) or malformed: nothing to play.
+                    } else if h.payload_type == stream::H264_PT {
+                        let rot = rtp::video_rotation(&ext);
+                        receive_video(&shared, &mut remote, h.ssrc, h.seq, payload, marker, h.timestamp, rot, false, now_ms, now);
+                    } else if h.payload_type == stream::H264_RTX_PT {
+                        let media = shared.video.rtx_of.lock().get(&h.ssrc).copied();
+                        if let (Some(media), Some((osn, orig))) = (media, crate::voice::h264::rtx_unwrap(&payload)) {
+                            let rot = rtp::video_rotation(&ext);
+                            receive_video(&shared, &mut remote, media, osn, orig.to_vec(), marker, h.timestamp, rot, true, now_ms, now);
+                        }
+                    } else if h.payload_type == rtp::OPUS_PT {
+                        if let Some(feeds) = feeds.as_mut() {
+                            receive_audio(&payload, &h, &shared, &emit, feeds, &mut streams, &mut pcm, &mut next_slot, now);
+                        }
                     }
                 }
             }
+        }
+        // Timeouts and retries, also when nothing arrived.
+        let wanted = std::mem::take(&mut *shared.keyframe_wanted.lock());
+        let ssrcs: Vec<u32> = remote.keys().copied().collect();
+        for ssrc in ssrcs {
+            if let Some(rs) = remote.get_mut(&ssrc) {
+                if !wanted.is_empty() && shared.video.users.lock().get(&ssrc).is_some_and(|u| wanted.contains(u)) {
+                    rs.want_keyframe();
+                }
+                let out = rs.poll(now_ms, now);
+                deliver_video(&shared, ssrc, out, rs.rotation, &mut rs.count);
+            }
+        }
+        if tcc_clock.due(now_ms) {
+            let audio = shared.video.ssrcs.lock().audio;
+            if let (Some(media), Some(fb)) = (shared.video.media(), tcc.build(audio)) {
+                media.send_rtcp(&fb);
+            }
+        }
+        if report_clock.due(now_ms) {
+            send_receiver_reports(&shared, &mut remote, now_ms);
         }
         for (ssrc, st) in streams.iter_mut() {
             if st.speaking && now.duration_since(st.last_voice) > Duration::from_millis(250) {
@@ -628,30 +733,72 @@ fn receive(sock: UdpSocket, open: Aead, mut feeds: Option<Feeds>, shared: Arc<Sh
     }
 }
 
-/// One remote video packet: depacketize, decrypt the frame (DAVE), hand it to the app's decoder.
-fn receive_video(open: &Aead, pkt: &[u8], h: &rtp::Incoming, shared: &Shared, remote: &mut HashMap<u32, RemoteStream>, now: Instant) {
-    let Some(user) = shared.video.users.lock().get(&h.ssrc).copied() else { return };
-    let Some(payload) = open.open(pkt, h) else { return };
-    let marker = pkt[1] & 0x80 != 0;
-    let rs = remote.entry(h.ssrc).or_insert_with(RemoteStream::new);
-    let (frame, want_key) = rs.push(h.seq, &payload, marker, now);
-    if want_key {
+/// One remote video packet (or its RTX copy): reorder, request what is missing, decode what completed.
+#[allow(clippy::too_many_arguments)]
+fn receive_video(shared: &Shared, remote: &mut HashMap<u32, RemoteStream>, ssrc: u32, seq: u16, payload: Vec<u8>, marker: bool, timestamp: u32, rotation: Option<u16>, via_rtx: bool, now_ms: u64, now: Instant) {
+    if !shared.video.users.lock().contains_key(&ssrc) {
+        return;
+    }
+    let rs = remote.entry(ssrc).or_insert_with(RemoteStream::new);
+    if let Some(r) = rotation {
+        rs.rotation = r;
+    }
+    let out = rs.push(seq, recv::Packet { payload, marker, timestamp }, via_rtx, now_ms, now);
+    deliver_video(shared, ssrc, out, rs.rotation, &mut rs.count);
+}
+
+/// Send what a stream asked for (NACK, PLI) and hand finished frames to the app's decoder.
+/// Frames that cannot be handed over are counted, so the 1 s summary says why video is missing.
+fn deliver_video(shared: &Shared, ssrc: u32, out: stream::RxOut, rotation: u16, count: &mut stream::RxCount) {
+    if out.pli || !out.nacks.is_empty() {
         if let Some(media) = shared.video.media() {
             let audio = shared.video.ssrcs.lock().audio;
-            media.send_rtcp(&stream::pli(audio, h.ssrc));
+            if !out.nacks.is_empty() {
+                media.send_rtcp(&crate::voice::rtcp::nack(audio, ssrc, &out.nacks));
+            }
+            if out.pli {
+                media.send_rtcp(&stream::pli(audio, ssrc));
+            }
         }
     }
-    if let (Some(f), Some(io)) = (frame, shared.video.io()) {
-        if let Some(annexb) = shared.dave.lock().decrypt_video(user, &f.annexb) {
-            (io.frames)(stream::RemoteFrame { user, annexb, keyframe: f.keyframe, pts: h.timestamp });
+    let Some(user) = shared.video.users.lock().get(&ssrc).copied() else { return };
+    let Some(io) = shared.video.io() else {
+        count.no_sink += out.frames.len() as u32;
+        return;
+    };
+    for (f, ts) in out.frames {
+        match shared.dave.lock().decrypt_video(user, &f.annexb) {
+            Some(annexb) => (io.frames)(stream::RemoteFrame { user, annexb, keyframe: f.keyframe, pts: ts, rotation }),
+            None => count.dave_failed += 1,
+        }
+    }
+}
+
+/// Once a second: a receiver report (with our CNAME) for every video stream that sent something, and
+/// one debug line per stream with what arrived, what was repaired and what was given up on.
+fn send_receiver_reports(shared: &Shared, remote: &mut HashMap<u32, RemoteStream>, now_ms: u64) {
+    let audio = shared.video.ssrcs.lock().audio;
+    let media = shared.video.media();
+    for (ssrc, rs) in remote.iter_mut() {
+        let c = std::mem::take(&mut rs.count);
+        if c.packets == 0 && c.recovered == 0 {
+            continue;
+        }
+        let skipped = rs.take_skipped();
+        tracing::debug!(target: "unison_core::voice", ssrc = *ssrc, packets = c.packets, recovered = c.recovered, nacked = c.nacked, given_up = skipped, frames = c.frames, dave_failed = c.dave_failed, no_sink = c.no_sink, keyframe_requests = c.plis, "video rx, last 1 s");
+        if let (Some(media), Some(block)) = (media.as_ref(), rs.stats.block(*ssrc, now_ms)) {
+            if audio != 0 {
+                let mut pkt = crate::voice::rtcp::receiver_report(audio, &block);
+                pkt.extend_from_slice(&crate::voice::rtcp::sdes_cname(audio, &media.cname));
+                media.send_rtcp(&pkt);
+            }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn receive_audio(
-    open: &Aead,
-    pkt: &[u8],
+    payload: &[u8],
     h: &rtp::Incoming,
     shared: &Shared,
     emit: &Emit,
@@ -662,7 +809,7 @@ fn receive_audio(
     now: Instant,
 ) {
     let Some(user) = shared.users.lock().get(&h.ssrc).copied() else { return };
-    let Some(frame) = open.open(pkt, h).and_then(|f| shared.dave.lock().decrypt(user, &f)) else { return };
+    let Some(frame) = shared.dave.lock().decrypt(user, payload) else { return };
     let st = streams.entry(h.ssrc).or_insert_with(|| {
         let slot = *next_slot % audio::SLOTS;
         *next_slot += 1;

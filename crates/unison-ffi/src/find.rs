@@ -203,7 +203,7 @@ impl UnisonEngine {
                 } else {
                     guild
                 };
-                Some(hit(ch.name.clone().unwrap_or_default(), context, None, ch.is_text_like() && s.is_unread(ch) && !s.is_channel_muted(ch), s.mention_count(ch.id), s.is_channel_muted(ch)))
+                Some(hit(ch.name.clone().unwrap_or_default(), context, None, ch.has_text_chat() && s.is_unread(ch) && !s.is_channel_muted(ch), s.mention_count(ch.id), s.is_channel_muted(ch)))
             }
         }
     }
@@ -226,14 +226,14 @@ impl UnisonEngine {
             let Some(sess) = self.inner.session(account) else { continue };
             let s = sess.store.read();
             let acc_s = account.to_string();
-            let boost = if Some(account) == active { 5 } else { 0 };
+            let boost = if Some(account) == active { rules::ACTIVE_ACCOUNT_FIRST } else { 0 };
             let points = |ch: Id| recents.points(&acc_s, &ch.to_string(), now);
             let cue = |unread: bool, mentions: u32| if mentions > 0 { 15 } else if unread { 8 } else { 0 };
             if accounts.len() > 1 && !in_guild {
                 if let Some(me) = &s.me {
                     fold_into(&mut buf, me.display_name());
                     if let Some(sc) = rules::score_place(terms, &buf, "") {
-                        out.push(Cand { score: sc - 2, acc: ai, kind: PlaceKind::Account, guild: None, channel: None, user: None });
+                        out.push(Cand { score: sc - 2 + boost, acc: ai, kind: PlaceKind::Account, guild: None, channel: None, user: None });
                     }
                 }
             }
@@ -262,7 +262,7 @@ impl UnisonEngine {
                     if !s.can_view(c) {
                         continue;
                     }
-                    let unread = c.is_text_like() && s.is_unread(c);
+                    let unread = c.has_text_chat() && s.is_unread(c);
                     out.push(Cand {
                         score: sc + boost + points(c.id) + cue(unread, s.mention_count(c.id)) - if s.is_channel_muted(c) { 12 } else { 0 },
                         acc: ai,
@@ -323,7 +323,7 @@ impl UnisonEngine {
                     continue;
                 }
                 let mentions = s.mention_count(*cid);
-                if (mentions > 0 || (ch.is_text_like() && s.is_unread(ch))) && !s.is_channel_muted(ch) && s.can_view(ch) && (!ch.is_thread() || ch.member.is_some()) {
+                if (mentions > 0 || (ch.has_text_chat() && s.is_unread(ch))) && !s.is_channel_muted(ch) && s.can_view(ch) && (!ch.is_thread() || ch.member.is_some()) {
                     let key = mentions as i32 * 1000 + recents.points(&acc_s, &cid.to_string(), now_ms());
                     unread.push((key, Cand { score: key, acc: ai, kind: place_kind(ch), guild: ch.guild_id, channel: Some(*cid), user: None }));
                 }
@@ -526,7 +526,7 @@ impl UnisonEngine {
                 hits.extend(page.hits.into_iter().map(|h| (a, h)));
             }
             if !single {
-                hits.sort_by_key(|(_, h)| std::cmp::Reverse(h.message.0));
+                rules::sort_active_first(&mut hits, |(a, _)| Some(*a) == active, |(_, h)| h.message.0);
                 hits = hits.into_iter().skip(req.offset as usize).take(req.limit.max(1) as usize).collect();
             }
             for (a, h) in hits {

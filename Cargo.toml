@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "tools/watcher"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -16,6 +16,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+
+# wreq-util 3.0.0-rc.14 with `zstd` raised from 0.13 to 0.14 (which carries zstd-safe 8: the 0.13 line has
+# open memory-safety advisories and decodes certificates from the network). Drop when upstream bumps it.
+[patch.crates-io]
+wreq-util = { path = "third_party/wreq-util" }
 
 [profile.release]
 lto = "fat"

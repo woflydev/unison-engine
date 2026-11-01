@@ -69,7 +69,7 @@ impl UnisonEngine {
                     .session(e.account)
                     .map(|s| {
                         let st = s.store.read();
-                        (location(&st, e.channel), preview_text(&st, e.guild, &e.preview, 140))
+                        (location(&st, e.channel), preview_text(&st, crate::messages::guild_of_channel(&st, e.channel, e.guild), &e.preview, 140))
                     })
                     .unwrap_or_else(|| (String::new(), e.preview.clone()));
                 InboxItem {
