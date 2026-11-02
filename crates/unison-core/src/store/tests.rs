@@ -108,6 +108,32 @@ fn reactions_count_and_me() {
 }
 
 #[test]
+fn own_reaction_shows_at_once_and_the_echo_is_not_counted_twice() {
+    let mut s = store();
+    let ch = Snowflake(11);
+    let m = json!({"id": "1", "channel_id": "11", "author": {"id": "2"}, "content": "x", "timestamp": "t",
+                   "reactions": [{"emoji": {"name": "🔥"}, "count": 2, "me": false}]});
+    s.set_history_latest(ch, vec![serde_json::from_value(m).unwrap()], false);
+    let msg = Snowflake(1);
+    // A new reaction and one more on an existing chip.
+    assert_eq!(s.apply_own_reaction(ch, msg, "👍", true), vec![Delta::MessageUpdated { channel: ch, message: msg }]);
+    assert_eq!(s.apply_own_reaction(ch, msg, "🔥", true).len(), 1);
+    let rx = &s.history[&ch].messages[0].reactions;
+    assert_eq!((rx[0].count, rx[0].me, rx[1].count, rx[1].me), (3, true, 1, true));
+    // Again: nothing to change. The gateway's echo of the same reaction changes nothing either.
+    assert!(s.apply_own_reaction(ch, msg, "🔥", true).is_empty());
+    let echo = term(json!({"user_id": "1", "channel_id": "11", "message_id": "1", "emoji": {"name": "🔥"}}));
+    assert!(s.apply("MESSAGE_REACTION_ADD", &echo).unwrap().is_empty());
+    assert_eq!(s.history[&ch].messages[0].reactions[0].count, 3);
+    // A refused request is taken back.
+    assert_eq!(s.apply_own_reaction(ch, msg, "👍", false).len(), 1);
+    assert_eq!(s.history[&ch].messages[0].reactions.len(), 1);
+    // A custom emoji by `name:id`.
+    assert_eq!(s.apply_own_reaction(ch, msg, "blob:42", true).len(), 1);
+    assert_eq!(s.history[&ch].messages[0].reactions[1].emoji.id, Some(Snowflake(42)));
+}
+
+#[test]
 fn reaction_add_many_folds_users() {
     let mut s = store();
     let ch = Snowflake(11);

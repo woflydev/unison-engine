@@ -13,7 +13,7 @@ use crate::forum::{self, ForumQuery};
 use crate::gateway::{self, GatewayConfig, GatewayEvent, GatewayHandle};
 use crate::intent::UserIntent;
 use crate::model::{Channel, Id, Message};
-use crate::power::{Batcher, PowerState};
+use crate::power::{Batcher, PowerState, Throttle};
 use crate::rest::{LocalFile, NewForumPost, OutgoingMessage, Rest};
 use crate::snowflake::Snowflake;
 use crate::store::{Delta, Store, perm};
@@ -242,9 +242,13 @@ impl Session {
     async fn pump(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<GatewayEvent>) {
         let mut power = self.power_tx.subscribe();
         let mut batch: Batcher<Delta> = Batcher::default();
+        // Reaction updates of other people: the first of a message shows at once, a burst after it one
+        // per 250 ms (a busy message in a big server would otherwise rebuild its row dozens of times a second).
+        let mut reactions: Throttle<(Id, Id)> = Throttle::new(Duration::from_millis(250));
         loop {
             // No armed flush means no timer: sleep an hour at a time (never wakes in practice).
             let deadline = batch.deadline().map(tokio::time::Instant::from_std).unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            let reactions_due = reactions.deadline().map(tokio::time::Instant::from_std).unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 ev = rx.recv() => {
                     let Some(ev) = ev else { break };
@@ -297,9 +301,28 @@ impl Session {
                                 let _ = self.flush_cache();
                             }
                             let p = *power.borrow();
-                            batch.push(Instant::now(), p, deltas, |d| matches!(d, Delta::Typing { .. } | Delta::MemberList { .. }));
+                            let now = Instant::now();
+                            // Hidden, everything is held by the batch until the window is back on screen.
+                            let deltas = if name.starts_with("MESSAGE_REACTION") && p.delta_flush().is_some() {
+                                deltas
+                                    .into_iter()
+                                    .filter(|d| match d {
+                                        Delta::MessageUpdated { channel, message } => reactions.offer(now, (*channel, *message)),
+                                        _ => true,
+                                    })
+                                    .collect()
+                            } else {
+                                deltas
+                            };
+                            batch.push(now, p, deltas, |d| matches!(d, Delta::Typing { .. } | Delta::MemberList { .. }));
                         }
                     }
+                }
+                _ = tokio::time::sleep_until(reactions_due), if reactions.deadline().is_some() => {
+                    let now = Instant::now();
+                    let due: Vec<Delta> = reactions.take_due(now).into_iter().map(|(channel, message)| Delta::MessageUpdated { channel, message }).collect();
+                    let p = *power.borrow();
+                    batch.push(now, p, due, |_| false);
                 }
                 _ = tokio::time::sleep_until(deadline), if batch.deadline().is_some() => {
                     if let Some(out) = batch.take_due(Instant::now()) {
@@ -1305,8 +1328,22 @@ impl Session {
         Ok(())
     }
 
+    /// The reaction shows at once and is taken back if Discord refuses it (the store is the truth the
+    /// shells draw from, so every shell gets the same instant feedback).
     pub async fn react(&self, intent: UserIntent, channel: Id, message: Id, emoji: String, add: bool) -> Result<()> {
-        self.rest.react(intent, channel, message, &emoji, add).await
+        let shown = self.store.write().apply_own_reaction(channel, message, &emoji, add);
+        let applied = !shown.is_empty();
+        if applied {
+            (self.emit)(SessionEvent::Deltas(shown));
+        }
+        let result = self.rest.react(intent, channel, message, &emoji, add).await;
+        if result.is_err() && applied {
+            let undone = self.store.write().apply_own_reaction(channel, message, &emoji, !add);
+            if !undone.is_empty() {
+                (self.emit)(SessionEvent::Deltas(undone));
+            }
+        }
+        result
     }
 
     /// The official client sends typing at most once per ~8 s per channel; every keystroke would

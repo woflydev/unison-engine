@@ -1537,6 +1537,18 @@ impl Store {
         }
     }
 
+    /// The signed-in user's own reaction, shown before Discord confirms it (and taken back if the request
+    /// fails): `emoji` is a unicode emoji or `name:id`. Nothing changes, and no delta, when the message
+    /// already shows that state. The gateway's echo of the same reaction is then ignored by `on_reaction`.
+    pub fn apply_own_reaction(&mut self, channel: Id, message: Id, emoji: &str, add: bool) -> Vec<Delta> {
+        let Some(user_id) = self.my_id() else { return vec![] };
+        let emoji = match emoji.split_once(':') {
+            Some((name, id)) => Emoji { id: id.parse().ok(), name: Some(name.to_string()), ..Default::default() },
+            None => Emoji { name: Some(emoji.to_string()), ..Default::default() },
+        };
+        self.on_reaction(ReactionEvent { user_id, channel_id: channel, message_id: message, emoji, burst: false }, add)
+    }
+
     fn on_reaction(&mut self, r: ReactionEvent, add: bool) -> Vec<Delta> {
         let me = self.my_id();
         let Some(m) = self.message_mut(r.channel_id, r.message_id) else { return vec![] };
@@ -1544,6 +1556,10 @@ impl Store {
         match m.reactions.iter_mut().position(|x| same_emoji(&x.emoji, &r.emoji)) {
             Some(i) => {
                 let x = &mut m.reactions[i];
+                // Already shown (our own change, applied before the gateway's echo of it arrived).
+                if mine && !r.burst && x.me == add {
+                    return vec![];
+                }
                 if add {
                     x.count += 1;
                     if r.burst {
@@ -1571,7 +1587,7 @@ impl Store {
                 burst_count: r.burst as u32,
                 me_burst: mine && r.burst,
             }),
-            None => {}
+            None => return vec![],
         }
         vec![Delta::MessageUpdated { channel: r.channel_id, message: r.message_id }]
     }

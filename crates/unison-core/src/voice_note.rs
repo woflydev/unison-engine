@@ -43,6 +43,38 @@ pub struct VoiceNote {
     /// Loudest sample of each 20 ms frame, 0...1.
     peaks: Vec<f32>,
     frames: usize,
+    agc: Agc,
+}
+
+/// Evens out the level of a recording. The raw microphone (what the shell taps for a voice message) is far
+/// quieter than the call path, which runs through the system's voice processing with automatic gain: a
+/// MacBook's microphone peaked near -28 dBFS, so a voice message sounded faint next to any other media.
+/// A slow gain per 20 ms frame brings speech to about -20 dBFS RMS, never above 21 dB of boost, fast to
+/// back off and gentle to come up, with room noise below the floor left alone.
+struct Agc {
+    gain: f32,
+}
+
+impl Agc {
+    const TARGET_RMS: f32 = 0.1;
+    const FLOOR_RMS: f32 = 0.003;
+    const MAX_GAIN: f32 = 12.0;
+
+    fn process(&mut self, frame: &mut [f32]) {
+        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len().max(1) as f32).sqrt();
+        if rms > Self::FLOOR_RMS {
+            let want = (Self::TARGET_RMS / rms).clamp(1.0, Self::MAX_GAIN);
+            let rate = if want < self.gain { 0.5 } else { 0.08 };
+            self.gain += (want - self.gain) * rate;
+        }
+        for s in frame.iter_mut() {
+            *s *= self.gain;
+            // Soft limit above 0.9, so a loud word after a quiet stretch never clips.
+            if s.abs() > 0.9 {
+                *s = s.signum() * (0.9 + (s.abs() - 0.9).tanh() * 0.1);
+            }
+        }
+    }
 }
 
 // The encoder is used from one thread at a time (the recorder holds it behind a mutex).
@@ -67,7 +99,7 @@ impl VoiceNote {
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_SIGNAL_REQUEST, ffi::OPUS_SIGNAL_VOICE);
             ffi::opus_encoder_ctl(raw, ffi::OPUS_SET_COMPLEXITY_REQUEST, 8i32);
         }
-        Some(Self { raw, pending: Vec::new(), out: [0; MAX_PACKET], packets: Vec::new(), peaks: Vec::new(), frames: 0 })
+        Some(Self { raw, pending: Vec::new(), out: [0; MAX_PACKET], packets: Vec::new(), peaks: Vec::new(), frames: 0, agc: Agc { gain: 1.0 } })
     }
 
     pub fn elapsed_secs(&self) -> f64 {
@@ -87,7 +119,8 @@ impl VoiceNote {
         }
         self.pending.extend_from_slice(samples);
         while self.pending.len() >= FRAME && !self.full() {
-            let frame: Vec<f32> = self.pending.drain(..FRAME).collect();
+            let mut frame: Vec<f32> = self.pending.drain(..FRAME).collect();
+            self.agc.process(&mut frame);
             self.peaks.push(frame.iter().fold(0f32, |m, s| m.max(s.abs())).min(1.0));
             let n = unsafe { ffi::opus_encode_float(self.raw, frame.as_ptr(), FRAME as i32, self.out.as_mut_ptr(), MAX_PACKET as i32) };
             if n > 0 {
@@ -261,6 +294,23 @@ mod tests {
         let w = base64::engine::general_purpose::STANDARD.decode(&f.waveform).unwrap();
         assert!(!w.is_empty() && w.len() <= 256);
         assert_eq!(*w.iter().max().unwrap(), 255);
+    }
+
+    #[test]
+    fn quiet_speech_is_brought_up_and_silence_is_left_alone() {
+        let mut agc = Agc { gain: 1.0 };
+        let mut frame = vec![0.0f32; FRAME];
+        for _ in 0..40 {
+            for (i, s) in frame.iter_mut().enumerate() { *s = 0.02 * (i as f32 * 0.3).sin(); }
+            agc.process(&mut frame);
+        }
+        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
+        assert!(rms > 0.07 && rms < 0.13, "speech rms {rms}");
+        let mut hiss: Vec<f32> = (0..FRAME).map(|i| 0.001 * (i as f32).sin()).collect();
+        let before = hiss.clone();
+        let mut fresh = Agc { gain: 1.0 };
+        fresh.process(&mut hiss);
+        assert_eq!(hiss, before, "noise below the floor is not amplified");
     }
 
     #[test]

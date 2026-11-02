@@ -1,5 +1,7 @@
 //! One power state drives batching and work everywhere in the core.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,61 @@ impl<T: PartialEq> Batcher<T> {
     }
 }
 
+/// Lets the first update of a key through at once and holds the rest to one per `window`: a busy
+/// message in a big server gets dozens of reactions a second, and rebuilding its row for each is work
+/// nobody can see. Pure (the caller passes the clock), like `Batcher`.
+#[derive(Debug)]
+pub struct Throttle<K: Eq + Hash + Clone> {
+    window: Duration,
+    last: HashMap<K, Instant>,
+    held: Vec<K>,
+}
+
+impl<K: Eq + Hash + Clone> Throttle<K> {
+    pub fn new(window: Duration) -> Self {
+        Self { window, last: HashMap::new(), held: Vec::new() }
+    }
+
+    /// True when `key` may go out now (its first update, or the window has passed). Otherwise it is held
+    /// and comes back from `take_due` once, however many updates arrive meanwhile.
+    pub fn offer(&mut self, now: Instant, key: K) -> bool {
+        if self.last.len() > 512 {
+            let window = self.window;
+            self.last.retain(|_, t| now.duration_since(*t) < window);
+        }
+        match self.last.get(&key) {
+            Some(t) if now.duration_since(*t) < self.window => {
+                if !self.held.contains(&key) {
+                    self.held.push(key);
+                }
+                false
+            }
+            _ => {
+                self.held.retain(|k| k != &key);
+                self.last.insert(key, now);
+                true
+            }
+        }
+    }
+
+    /// When the next held key is due; `None` means no timer is needed.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.held.iter().filter_map(|k| self.last.get(k)).map(|t| *t + self.window).min()
+    }
+
+    /// The held keys whose window has passed (each counts as sent now).
+    pub fn take_due(&mut self, now: Instant) -> Vec<K> {
+        let (due, still): (Vec<K>, Vec<K>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|k| self.last.get(k).is_none_or(|t| *t + self.window <= now));
+        self.held = still;
+        for k in &due {
+            self.last.insert(k.clone(), now);
+        }
+        due
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +247,22 @@ mod tests {
         for p in ALL {
             assert_eq!(p.delta_flush().is_none(), p == PowerState::Background, "{p:?}");
         }
+    }
+
+    #[test]
+    fn throttle_sends_first_at_once_then_one_per_window() {
+        let t0 = Instant::now();
+        let w = Duration::from_millis(250);
+        let mut t = Throttle::new(w);
+        assert!(t.offer(t0, "a"), "first goes out at once");
+        assert!(!t.offer(t0 + Duration::from_millis(10), "a"));
+        assert!(!t.offer(t0 + Duration::from_millis(20), "a"));
+        assert!(t.offer(t0 + Duration::from_millis(20), "b"), "another key is independent");
+        assert_eq!(t.deadline(), Some(t0 + w));
+        assert!(t.take_due(t0 + Duration::from_millis(249)).is_empty());
+        assert_eq!(t.take_due(t0 + w), vec!["a"], "one trailing update for any number held");
+        assert_eq!(t.deadline(), None);
+        assert!(!t.offer(t0 + w + Duration::from_millis(5), "a"), "the trailing send starts a new window");
+        assert!(t.offer(t0 + w * 3, "a"), "a quiet key goes out at once again");
     }
 }
