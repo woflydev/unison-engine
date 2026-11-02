@@ -106,6 +106,12 @@ impl UnisonEngine {
         Ok(self.inner.login_password_retry(login, password, c)?)
     }
 
+    /// The captcha shown while signing in by QR code was solved.
+    pub fn login_qr_captcha(&self, captcha_key: String, rqtoken: Option<String>, session_id: Option<String>) -> Result<(), FfiError> {
+        let c = unison_core::error::CaptchaSolution { key: captcha_key, rqtoken, session_id };
+        Ok(self.inner.login_qr_captcha(c)?)
+    }
+
     /// Second factor: `kind` is `totp`, `sms`, `backup` or `webauthn`.
     pub fn login_mfa(
         &self,

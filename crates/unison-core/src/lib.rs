@@ -26,6 +26,7 @@ pub mod find;
 pub mod forum;
 pub mod gateway;
 pub mod folders;
+pub mod guild_draft;
 pub mod guild_admin;
 pub mod guild_events;
 pub mod intent;

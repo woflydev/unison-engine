@@ -1470,7 +1470,11 @@ impl Store {
         if m.mentions.iter().any(|u| u.id == me) {
             return true;
         }
-        let Some(g) = m.guild_id else { return false };
+        // REST pages (history, catch-up, Inbox) carry no server id; the channel knows it. Without
+        // this a role or @everyone ping highlighted when it arrived live and not once loaded.
+        let Some(g) = m.guild_id.or_else(|| self.channels.get(&m.channel_id).and_then(|c| c.guild_id)) else {
+            return false;
+        };
         let settings = self.guild_settings.get(&g);
         if m.mention_everyone && !settings.is_some_and(|s| s.suppress_everyone) {
             return true;

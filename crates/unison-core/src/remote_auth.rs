@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::error::CaptchaSolution;
 use crate::rest::Rest;
 use crate::transport::WsMessage;
 use crate::{Error, Result};
@@ -34,15 +35,26 @@ pub enum RemoteAuthEvent {
     Failed { message: String },
 }
 
-pub fn start(rest: Arc<Rest>, events: mpsc::UnboundedSender<RemoteAuthEvent>) -> tokio::task::JoinHandle<()> {
+/// `solutions` carries the answer to a captcha Discord asks for after the phone approves (the
+/// shell shows it, as for the password flow).
+pub fn start(
+    rest: Arc<Rest>,
+    events: mpsc::UnboundedSender<RemoteAuthEvent>,
+    solutions: mpsc::UnboundedReceiver<CaptchaSolution>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(rest, &events).await {
-            let _ = events.send(RemoteAuthEvent::Failed { message: e.to_string() });
+        if let Err(e) = run(rest, &events, solutions).await {
+            // The sentence a person can act on, never the debug text ("captcha required").
+            let _ = events.send(RemoteAuthEvent::Failed { message: e.user_message() });
         }
     })
 }
 
-async fn run(rest: Arc<Rest>, events: &mpsc::UnboundedSender<RemoteAuthEvent>) -> Result<()> {
+async fn run(
+    rest: Arc<Rest>,
+    events: &mpsc::UnboundedSender<RemoteAuthEvent>,
+    mut solutions: mpsc::UnboundedReceiver<CaptchaSolution>,
+) -> Result<()> {
     // The login page loads experiments first; the response sets the pre-login fingerprint and cookies.
     match tokio::time::timeout(Duration::from_secs(8), rest.fetch_fingerprint()).await {
         Ok(Err(e)) => tracing::debug!("experiments fetch failed: {e}"),
@@ -111,7 +123,35 @@ async fn run(rest: Arc<Rest>, events: &mpsc::UnboundedSender<RemoteAuthEvent>) -
                     }
                     "pending_login" => {
                         let ticket = v["ticket"].as_str().unwrap_or("");
-                        let encrypted = rest.remote_auth_login(ticket).await?;
+                        // Discord may ask for a captcha before it hands over the token (a new place or a
+                        // risky network). Show it, keep the socket alive while it is solved, retry.
+                        let mut solved: Option<CaptchaSolution> = None;
+                        let encrypted = loop {
+                            match rest.remote_auth_login(ticket, solved.take()).await {
+                                Ok(e) => break e,
+                                Err(Error::Captcha(c)) => {
+                                    let c = *c;
+                                    let _ = events.send(RemoteAuthEvent::Captcha {
+                                        service: c.captcha_service, sitekey: c.captcha_sitekey, rqdata: c.captcha_rqdata,
+                                        rqtoken: c.captcha_rqtoken, session_id: c.captcha_session_id,
+                                    });
+                                    let mut open = true;
+                                    loop {
+                                        tokio::select! {
+                                            s = solutions.recv() => match s {
+                                                Some(s) => { solved = Some(s); break }
+                                                None => return Ok(()),
+                                            },
+                                            m = ws.recv(), if open => { open = m.is_some(); }
+                                            _ = tokio::time::sleep(heartbeat), if open => {
+                                                let _ = ws.send(WsMessage::Text(json!({ "op": "heartbeat" }).to_string().into())).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        };
                         let token = String::from_utf8(decrypt(&encrypted)?).map_err(|e| Error::Crypto(e.to_string()))?;
                         let _ = events.send(RemoteAuthEvent::LoggedIn { token });
                         let _ = ws.close(1000u16, "").await;

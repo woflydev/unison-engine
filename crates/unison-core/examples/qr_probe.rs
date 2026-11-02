@@ -10,7 +10,8 @@ async fn main() {
     let identity = Arc::new(ClientIdentity::new(profile, HostInfo::detect()));
     let rest = Arc::new(Rest::new(transport.clone(), identity, Arc::new(parking_lot::RwLock::new(Policy::default()))));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let task = start(rest, tx);
+    let (_ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+    let task = start(rest, tx, crx);
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(20));
     tokio::pin!(deadline);
     loop {

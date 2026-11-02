@@ -381,14 +381,14 @@ impl Rest {
 
     /// Exchange a QR login ticket. The gesture happened on the user's phone, so no local intent exists;
     /// this is the only unauthenticated POST and it is reachable solely from the remote-auth flow.
-    pub(crate) async fn remote_auth_login(&self, ticket: &str) -> Result<String> {
+    pub(crate) async fn remote_auth_login(&self, ticket: &str, captcha: Option<CaptchaSolution>) -> Result<String> {
         let body = json!({ "ticket": ticket });
         let bytes = self
             .request(
                 Method::POST,
                 "/users/@me/remote-auth/login",
                 Some(body),
-                None,
+                captcha,
             )
             .await?;
         let v: Value = serde_json::from_slice(&bytes)?;

@@ -183,6 +183,41 @@ impl UserPrefs {
     }
 }
 
+/// One server notification change from Settings: only the `Some` fields apply. `channel_id` set
+/// means the muted/level fields are for that channel (3 = the server's level).
+#[derive(uniffi::Record, Clone, Debug, Default)]
+pub struct GuildNotifChange {
+    pub channel_id: Option<String>,
+    pub muted: Option<bool>,
+    pub level: Option<u8>,
+    pub suppress_everyone: Option<bool>,
+    pub suppress_roles: Option<bool>,
+}
+
+impl GuildNotifChange {
+    fn body(&self) -> serde_json::Value {
+        use serde_json::{Map, Value, json};
+        let mut b = Map::new();
+        if let Some(m) = self.muted {
+            let mute = unison_core::rest::mute_body(m.then_some(-1), 0);
+            b.extend(mute.as_object().cloned().unwrap_or_default());
+        }
+        if let Some(l) = self.level {
+            b.insert("message_notifications".into(), json!(l.min(3)));
+        }
+        let Some(c) = &self.channel_id else {
+            if let Some(v) = self.suppress_everyone {
+                b.insert("suppress_everyone".into(), v.into());
+            }
+            if let Some(v) = self.suppress_roles {
+                b.insert("suppress_roles".into(), v.into());
+            }
+            return Value::Object(b);
+        };
+        unison_core::rest::channel_override_body(id(c), Value::Object(b))
+    }
+}
+
 /// Account facts from READY, shown read-only (changing them needs a password or 2FA on Discord).
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct UserAccountInfo {
@@ -320,16 +355,52 @@ impl UnisonEngine {
         )
     }
 
+    /// The settings as Settings shows them: saved values with the unsaved changes laid over.
     pub fn user_prefs(&self, account_id: String) -> UserPrefs {
-        self.with_store(&account_id, |s| UserPrefs::from_core(&s.prefs))
+        self.inner
+            .session(id(&account_id))
+            .map(|s| UserPrefs::from_core(&s.effective_prefs()))
             .unwrap_or_default()
     }
 
-    /// Writes the `Some` fields via `PATCH /users/@me/settings-proto/1`.
+    /// Keep a settings change aside until `save_prefs` (the Settings save bar). Nothing is sent.
+    pub fn stage_prefs(&self, account_id: String, patch: UserPrefs) {
+        if let Some(s) = self.inner.session(id(&account_id)) {
+            s.stage_prefs(&patch.to_core());
+        }
+    }
+
+    /// Writes the `Some` fields at once via `PATCH /users/@me/settings-proto/1`. Only for a sheet
+    /// with its own Save button (custom status); Settings panes stage instead (`stage_prefs`).
     pub fn update_prefs(&self, account_id: String, patch: UserPrefs, gesture: UserGesture) {
         self.spawn_write(account_id, gesture, move |s, i| async move {
             s.update_prefs(i, patch.to_core()).await
         });
+    }
+
+    /// Whether Settings holds changes that are not saved (the save bar).
+    pub fn has_pending_settings(&self, account_id: String) -> bool {
+        self.inner.session(id(&account_id)).is_some_and(|s| s.has_pending_settings())
+    }
+
+    /// Reset: forget the unsaved changes.
+    pub fn discard_settings(&self, account_id: String) {
+        if let Some(s) = self.inner.session(id(&account_id)) {
+            s.discard_settings();
+        }
+    }
+
+    /// Save Changes: everything staged goes out together, one request per thing that changed.
+    pub fn save_settings(&self, account_id: String, gesture: UserGesture) {
+        self.spawn_write(account_id, gesture, move |s, i| async move { s.save_settings(i).await });
+    }
+
+    /// Keep a server's notification change aside until `save_settings` (body as `PATCH
+    /// /users/@me/guilds/{id}/settings`).
+    pub fn stage_guild_notifications(&self, account_id: String, guild_id: String, change: GuildNotifChange) {
+        if let Some(s) = self.inner.session(id(&account_id)) {
+            s.stage_guild_settings(id(&guild_id), &change.body());
+        }
     }
 
     pub fn user_account_info(&self, account_id: String) -> Option<UserAccountInfo> {
@@ -412,11 +483,10 @@ impl UnisonEngine {
     /// Channels in a server that have their own mute or level, for the Notifications pane.
     pub fn channel_notification_overrides(&self, account_id: String, guild_id: String) -> Vec<ChannelOverrideItem> {
         let g = id(&guild_id);
+        let Some(sess) = self.inner.session(id(&account_id)) else { return vec![] };
+        let eff = sess.effective_guild_settings(g).unwrap_or_default();
         self.with_store(&account_id, |s| {
-            let mut v: Vec<ChannelOverrideItem> = s
-                .guild_settings
-                .get(&g)
-                .into_iter()
+            let mut v: Vec<ChannelOverrideItem> = std::iter::once(&eff)
                 .flat_map(|x| x.channel_overrides.iter())
                 .filter(|o| o.muted || o.message_notifications != 3)
                 .filter_map(|o| {
@@ -436,12 +506,15 @@ impl UnisonEngine {
     }
 
     pub fn guild_notification_levels(&self, account_id: String) -> Vec<GuildNotifItem> {
+        let Some(sess) = self.inner.session(id(&account_id)) else { return vec![] };
+        let eff = |g| sess.effective_guild_settings(g);
         self.with_store(&account_id, |s| {
             let mut v: Vec<GuildNotifItem> = s
                 .guilds
                 .values()
                 .map(|g| {
-                    let gs = s.guild_settings.get(&g.id);
+                    let gs = eff(g.id);
+                    let gs = gs.as_ref();
                     GuildNotifItem {
                         guild_id: g.id.to_string(),
                         name: g.name().to_string(),

@@ -36,6 +36,7 @@ Rules are in `docs/ARCHITECTURE.md`; this file says where the repo stands agains
 | 7 | `AppModel.sidebarOpen`, `sidebarColumnWidth`, `Dock` and `ChatTitle` (`RootView.swift`, `DesignSystem.swift`) | Pane open/closed and width are UI-only prefs; dock and title layout are window chrome with macOS toolbar constants | Fine in the shell; another shell draws its own chrome. Keep the rule (one owned width, interruptible, chat follows the live edge) |
 | 8 | Menu accelerators in `UnisonApp.swift` | The shortcut list is the core's (`keybinds.rs`, `keybind_table`), the binding to menu items is the shell's | Another shell translates `mod+shift+i` tokens to its modifier keys; custom bindings are not offered |
 | 9 | `Views/Cosmetics.swift`, `Views/LottieSticker.swift` | Drawing only: the core parses and decides (`cosmetics.rs`, `sticker_motion.rs`) | Fine; Lottie needs a player (`lottie-ios`; web has lottie-web) |
+| 10 | `AppModel+Settings.swift` `ProfileDraft`, `profileDirty`, `saveProfileDraft` | The Profiles pane's draft (display name, pronouns, about me) is kept and diffed in the shell, and the length limits (32/40/190) are applied there | Move to the core's settings draft (`Session::stage_*`) so the save bar covers it like the other settings |
 
 Fixed on 2026-11-01: update-check timing and the beta channel (`UpdatePrefs`, `update_check_due`), the native-calls switch and the call choices (`VoicePrefs`), the zstd advisories (`third_party/wreq-util` moves zstd to 0.14 / zstd-safe 8).
 

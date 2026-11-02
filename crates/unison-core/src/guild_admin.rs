@@ -281,6 +281,45 @@ pub fn data_uri(content_type: &str, bytes: &[u8]) -> Option<String> {
     Some(format!("data:{content_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
+/// What Save Changes does to the server's icon or banner.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageEdit {
+    Keep,
+    Remove,
+    Set(String, Vec<u8>),
+}
+
+/// The one `PATCH /guilds/{id}` body for the Overview page's Save Changes: only what changed.
+/// Empty when nothing did (nothing is sent).
+pub fn overview_body(name: Option<&str>, description: Option<&str>, icon: &ImageEdit, banner: &ImageEdit) -> Result<Value, String> {
+    let mut b = serde_json::Map::new();
+    if let Some(n) = name.map(str::trim) {
+        if n.is_empty() || n.chars().count() > 100 {
+            return Err("a server name is 1 to 100 characters".into());
+        }
+        b.insert("name".into(), n.into());
+    }
+    if let Some(d) = description {
+        if d.chars().count() > 120 {
+            return Err("a description is up to 120 characters".into());
+        }
+        b.insert("description".into(), if d.trim().is_empty() { Value::Null } else { d.into() });
+    }
+    for (key, edit) in [("icon", icon), ("banner", banner)] {
+        match edit {
+            ImageEdit::Keep => {}
+            ImageEdit::Remove => {
+                b.insert(key.into(), Value::Null);
+            }
+            ImageEdit::Set(ct, bytes) => {
+                let uri = data_uri(ct, bytes).ok_or("use a PNG, JPEG, GIF or WebP under 10 MB")?;
+                b.insert(key.into(), uri.into());
+            }
+        }
+    }
+    Ok(Value::Object(b))
+}
+
 /// Emoji upload limit: 256 KiB.
 pub const MAX_EMOJI_BYTES: usize = 256 * 1024;
 
@@ -520,5 +559,22 @@ mod tests {
         let text = channel_permissions(true, false);
         assert!(text.iter().any(|p| p.1 == "Send Messages") && !text.iter().any(|p| p.1 == "Connect"));
         assert!(text.iter().any(|p| p.1 == "Manage Permissions"));
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    #[test]
+    fn the_overview_is_one_body_with_only_what_changed() {
+        let keep = ImageEdit::Keep;
+        assert_eq!(overview_body(None, None, &keep, &keep).unwrap(), json!({}));
+        let b = overview_body(Some(" New "), Some(""), &ImageEdit::Remove, &keep).unwrap();
+        assert_eq!(b, json!({ "name": "New", "description": null, "icon": null }));
+        assert!(overview_body(Some("  "), None, &keep, &keep).is_err());
+        assert!(overview_body(None, None, &ImageEdit::Set("text/html".into(), vec![1]), &keep).is_err());
+        let b = overview_body(None, None, &keep, &ImageEdit::Set("image/png".into(), vec![1, 2])).unwrap();
+        assert!(b["banner"].as_str().unwrap().starts_with("data:image/png;base64,"));
     }
 }

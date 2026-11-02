@@ -89,6 +89,12 @@ pub struct Session {
     pub nav: Mutex<crate::navstate::NavState>,
     /// Generation of the newest rail edit; only the newest one's delayed write is sent.
     folder_gen: std::sync::atomic::AtomicU64,
+    /// Settings the person changed and has not saved yet (the Settings save bar): one PATCH on
+    /// save instead of one per toggle. Holds only fields that differ from the saved ones.
+    pending_prefs: Mutex<crate::prefs::Prefs>,
+    prefs_saving: std::sync::atomic::AtomicBool,
+    /// The same for per-server notification settings, by server (`guild_draft`).
+    pending_guilds: Mutex<std::collections::BTreeMap<Id, serde_json::Map<String, Value>>>,
     dirty: Arc<Mutex<Vec<Id>>>,
     /// Signals the persist loop that gateway activity may have changed the store (no timer runs while idle).
     activity: tokio::sync::Notify,
@@ -149,6 +155,9 @@ impl Session {
             search_pages: Default::default(),
             profiles: Default::default(),
             folder_gen: std::sync::atomic::AtomicU64::new(0),
+            pending_prefs: Default::default(),
+            prefs_saving: Default::default(),
+            pending_guilds: Default::default(),
             nav: Mutex::new(nav_cache.get("nav").ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dirty: Arc::new(Mutex::new(Vec::new())),
             activity: tokio::sync::Notify::new(),
@@ -1935,6 +1944,24 @@ impl Session {
     }
 
     /// Rename a server or change its description; the gateway's `GUILD_UPDATE` refreshes the store.
+    /// Server Settings, Overview, Save Changes: name, description, icon and banner in one PATCH.
+    pub async fn save_guild_overview(
+        &self,
+        intent: UserIntent,
+        guild: Id,
+        name: Option<String>,
+        description: Option<String>,
+        icon: crate::guild_admin::ImageEdit,
+        banner: crate::guild_admin::ImageEdit,
+    ) -> Result<()> {
+        self.require_guild_perm(guild, crate::store::perm::MANAGE_GUILD)?;
+        let body = crate::guild_admin::overview_body(name.as_deref(), description.as_deref(), &icon, &banner).map_err(Error::Other)?;
+        if body.as_object().is_some_and(|o| o.is_empty()) {
+            return Ok(());
+        }
+        self.rest.edit_guild(intent, guild, body).await.map(|_| ())
+    }
+
     pub async fn edit_guild(&self, intent: UserIntent, guild: Id, name: Option<String>, description: Option<String>) -> Result<()> {
         self.require_guild_perm(guild, crate::store::perm::MANAGE_GUILD)?;
         let mut body = serde_json::Map::new();
@@ -2116,6 +2143,120 @@ impl Session {
         self.rest.accept_message_request(intent, channel).await?;
         let deltas = self.store.write().accept_message_request(channel);
         (self.emit)(SessionEvent::Deltas(deltas));
+        Ok(())
+    }
+
+    /// Keep a settings change aside until it is saved (nothing is sent). Settings, Appearance and
+    /// the rest stage here, so flipping toggles can never turn into a burst of requests.
+    pub fn stage_prefs(&self, patch: &crate::prefs::Prefs) {
+        {
+            let mut p = self.pending_prefs.lock();
+            p.merge(patch);
+            // Merge only ever adds Somes; a status stamp from a later edit replaces the older one.
+            if patch.status_created_at_ms.is_some() {
+                p.status_created_at_ms = patch.status_created_at_ms;
+            }
+            p.retain_changes(&self.store.read().prefs);
+        }
+        (self.emit)(SessionEvent::Deltas(vec![Delta::SettingsChanged]));
+    }
+
+    /// The saved settings with the unsaved changes laid over them: what Settings shows.
+    pub fn effective_prefs(&self) -> crate::prefs::Prefs {
+        let mut p = self.store.read().prefs.clone();
+        p.merge(&self.pending_prefs.lock());
+        p
+    }
+
+    /// Keep a per-server notification change aside (same body shape as `update_guild_settings`).
+    pub fn stage_guild_settings(&self, guild: Id, body: &Value) {
+        {
+            let base = self.store.read().guild_settings.get(&guild).cloned().unwrap_or_default();
+            let mut all = self.pending_guilds.lock();
+            let one = all.entry(guild).or_default();
+            crate::guild_draft::merge(one, body);
+            if crate::guild_draft::prune(one, &base) {
+                all.remove(&guild);
+            }
+        }
+        (self.emit)(SessionEvent::Deltas(vec![Delta::SettingsChanged]));
+    }
+
+    /// A server's notification settings with the unsaved changes laid over them.
+    /// `None` when the server has no settings at all, saved or staged.
+    pub fn effective_guild_settings(&self, guild: Id) -> Option<crate::model::UserGuildSettings> {
+        let base = self.store.read().guild_settings.get(&guild).cloned();
+        match (self.pending_guilds.lock().get(&guild), base) {
+            (Some(body), base) => Some(crate::guild_draft::apply(&base.unwrap_or_default(), body)),
+            (None, base) => base,
+        }
+    }
+
+    /// Whether Settings holds changes that are not saved.
+    pub fn has_pending_settings(&self) -> bool {
+        let mut p = self.pending_prefs.lock();
+        p.retain_changes(&self.store.read().prefs);
+        !p.is_blank() || !self.pending_guilds.lock().is_empty()
+    }
+
+    /// Throw the unsaved changes away.
+    pub fn discard_settings(&self) {
+        *self.pending_prefs.lock() = Default::default();
+        self.pending_guilds.lock().clear();
+        (self.emit)(SessionEvent::Deltas(vec![Delta::SettingsChanged, Delta::GuildsChanged]));
+    }
+
+    /// Save Changes: the staged settings go out together, one request for the account's settings
+    /// and one per server that changed, a beat apart. A second save while one is going out does
+    /// nothing. A refusal puts the saved values back and keeps what was not sent, so nothing is
+    /// lost; the gesture's intent is short-lived, so a long list that outlasts it stays staged for
+    /// the next press (`UserIntent::split`).
+    pub async fn save_settings(&self, intent: UserIntent) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.prefs_saving.swap(true, SeqCst) {
+            return Ok(());
+        }
+        let result = self.save_settings_inner(intent).await;
+        self.prefs_saving.store(false, SeqCst);
+        (self.emit)(SessionEvent::Deltas(vec![Delta::SettingsChanged, Delta::GuildsChanged]));
+        result
+    }
+
+    async fn save_settings_inner(&self, intent: UserIntent) -> Result<()> {
+        let mut intent = Some(intent);
+        let patch = {
+            let mut p = self.pending_prefs.lock();
+            p.retain_changes(&self.store.read().prefs);
+            p.clone()
+        };
+        if !patch.is_blank() {
+            let (now, rest) = intent.take().ok_or(Error::NoIntent)?.split();
+            intent = Some(rest);
+            let before = self.store.read().prefs.clone();
+            match self.update_prefs(now, patch).await {
+                Ok(()) => self.pending_prefs.lock().retain_changes(&self.store.read().prefs),
+                Err(e) => {
+                    self.store.write().prefs = before;
+                    return Err(e);
+                }
+            }
+        }
+        let guilds: Vec<(Id, Value)> = self.pending_guilds.lock().iter().map(|(g, b)| (*g, Value::Object(b.clone()))).collect();
+        for (n, (guild, body)) in guilds.into_iter().enumerate() {
+            if n > 0 {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            let (now, rest) = intent.take().ok_or(Error::NoIntent)?.split();
+            intent = Some(rest);
+            self.update_guild_settings(now, guild, body).await?;
+            let base = self.store.read().guild_settings.get(&guild).cloned().unwrap_or_default();
+            let mut all = self.pending_guilds.lock();
+            if let Some(one) = all.get_mut(&guild) {
+                if crate::guild_draft::prune(one, &base) {
+                    all.remove(&guild);
+                }
+            }
+        }
         Ok(())
     }
 

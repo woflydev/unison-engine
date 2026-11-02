@@ -86,6 +86,24 @@ pub struct GuildSettingsInfo {
     pub member_count: Option<u32>,
 }
 
+/// A server icon or banner edit made in Settings, applied on Save Changes.
+#[derive(uniffi::Enum, Clone, Debug)]
+pub enum ImageChange {
+    Keep,
+    Remove,
+    Set { content_type: String, bytes: Vec<u8> },
+}
+
+impl From<ImageChange> for unison_core::guild_admin::ImageEdit {
+    fn from(c: ImageChange) -> Self {
+        match c {
+            ImageChange::Keep => Self::Keep,
+            ImageChange::Remove => Self::Remove,
+            ImageChange::Set { content_type, bytes } => Self::Set(content_type, bytes),
+        }
+    }
+}
+
 #[uniffi::export]
 pub fn timeout_choices() -> Vec<TimeoutChoice> {
     moderation::TIMEOUT_CHOICES.iter().map(|(l, s)| TimeoutChoice { label: (*l).into(), secs: *s }).collect()
@@ -166,6 +184,13 @@ impl UnisonEngine {
 
     pub fn revoke_invite(&self, account_id: String, guild_id: String, code: String, gesture: UserGesture) {
         self.spawn_write(account_id, gesture, move |s, i| async move { s.revoke_invite(i, id(&guild_id), &code).await });
+    }
+
+    /// Save Changes on the Overview page: one `PATCH /guilds/{id}` with only what changed.
+    pub fn save_guild_overview(&self, account_id: String, guild_id: String, name: Option<String>, description: Option<String>, icon: ImageChange, banner: ImageChange, gesture: UserGesture) {
+        self.spawn_write(account_id, gesture, move |s, i| async move {
+            s.save_guild_overview(i, id(&guild_id), name, description, icon.into(), banner.into()).await
+        });
     }
 
     pub fn edit_guild(&self, account_id: String, guild_id: String, name: Option<String>, description: Option<String>, gesture: UserGesture) {

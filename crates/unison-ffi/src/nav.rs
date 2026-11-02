@@ -81,6 +81,15 @@ impl UnisonEngine {
         });
     }
 
+    /// Folder "Mark as Read": every server's unread channels in one ack (a request per server
+    /// tripped Discord's limit and showed "Slow down a moment").
+    pub fn mark_guilds_read(&self, account_id: String, guild_ids: Vec<String>, gesture: UserGesture) {
+        self.spawn_write(account_id, gesture, move |s, i| async move {
+            let guilds: Vec<_> = guild_ids.iter().map(|g| id(g)).collect();
+            s.mark_read_bulk(i, s.unread_targets_in(&guilds)).await
+        });
+    }
+
     /// Category "Mark as Read" (its unread children).
     pub fn mark_category_read(&self, account_id: String, guild_id: String, category_id: String, gesture: UserGesture) {
         self.spawn_write(account_id, gesture, move |s, i| async move {
@@ -150,8 +159,9 @@ impl UnisonEngine {
 
     pub fn guild_notify_state(&self, account_id: String, guild_id: String) -> NotifyState {
         let g = id(&guild_id);
-        self.with_store(&account_id, |s| {
-            s.guild_settings.get(&g).map_or(
+        let eff = self.inner.session(id(&account_id)).and_then(|s| s.effective_guild_settings(g));
+        self.with_store(&account_id, |_| {
+            eff.map_or(
                 NotifyState { muted: false, level: 0, suppress_everyone: false, suppress_roles: false },
                 |x| NotifyState {
                     muted: x.muted,
@@ -166,8 +176,9 @@ impl UnisonEngine {
 
     pub fn channel_notify_state(&self, account_id: String, guild_id: String, channel_id: String) -> NotifyState {
         let (g, c) = (id(&guild_id), id(&channel_id));
-        self.with_store(&account_id, |s| {
-            let o = s.guild_settings.get(&g).and_then(|x| x.channel_overrides.iter().find(|o| o.channel_id == c));
+        let eff = self.inner.session(id(&account_id)).and_then(|s| s.effective_guild_settings(g));
+        self.with_store(&account_id, |_| {
+            let o = eff.as_ref().and_then(|x| x.channel_overrides.iter().find(|o| o.channel_id == c));
             NotifyState {
                 muted: o.is_some_and(|o| o.muted),
                 level: o.map_or(3, |o| o.message_notifications),

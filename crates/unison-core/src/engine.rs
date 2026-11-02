@@ -59,6 +59,8 @@ pub struct Engine {
     login: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The unauthenticated client of an in-progress password sign-in (keeps cookies and fingerprint).
     pw_rest: Mutex<Option<Arc<Rest>>>,
+    /// Where the answer to a captcha asked for during QR sign-in goes.
+    qr_captcha: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CaptchaSolution>>>,
 }
 
 impl Engine {
@@ -91,6 +93,7 @@ impl Engine {
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             login: Mutex::new(None),
             pw_rest: Mutex::new(None),
+            qr_captcha: Mutex::new(None),
         }))
     }
 
@@ -147,7 +150,9 @@ impl Engine {
         let _guard = self.rt.enter();
         let rest = self.new_rest(None)?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = remote_auth::start(rest, tx);
+        let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+        *self.qr_captcha.lock() = Some(ctx);
+        let handle = remote_auth::start(rest, tx, crx);
         let me = self.clone();
         self.rt.spawn(async move {
             while let Some(ev) = rx.recv().await {
@@ -167,7 +172,14 @@ impl Engine {
         Ok(())
     }
 
+    /// The captcha shown during QR sign-in was solved: the sign-in carries on.
+    pub fn login_qr_captcha(&self, captcha: CaptchaSolution) -> Result<()> {
+        let Some(tx) = self.qr_captcha.lock().clone() else { return Err(Error::Other("no QR sign-in in progress".into())) };
+        tx.send(captcha).map_err(|_| Error::Other("The QR sign-in ended. Start again.".into()))
+    }
+
     pub fn cancel_login(&self) {
+        *self.qr_captcha.lock() = None;
         if let Some(h) = self.login.lock().take() {
             h.abort();
         }

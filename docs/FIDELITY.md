@@ -129,7 +129,7 @@ Read from the web client bundle (`web.*.js`, `discord_protos.discord_users.v1.*`
 
 | Write | Request | Body |
 |---|---|---|
-| Preloaded settings (theme, message display, animation, safety, notifications, status, locale) | `PATCH /users/@me/settings-proto/1` | `{settings: base64(partial PreloadedUserSettings)}`. The web client also sends `required_data_version` only for edits made offline; omitted online, as here. Response `{settings}` is the full proto. |
+| Preloaded settings (theme, message display, animation, safety, notifications, status, locale) | `PATCH /users/@me/settings-proto/1` | `{settings: base64(partial PreloadedUserSettings)}`. The web client also sends `required_data_version` only for edits made offline; omitted online, as here. Response `{settings}` is the full proto. Sent once per Save Changes (UX.md 5d.34), never per toggle; per-server notification changes are one `PATCH /users/@me/guilds/{id}/settings` per changed server, 600 ms apart. |
 | Display name | `PATCH /users/@me` | `{global_name}` (null clears). Web also sends `x-…md5` headers only for avatar changes. |
 | Bio, pronouns | `PATCH /users/@me/profile` | `{bio, pronouns}`, only changed keys |
 | Per-server notification default | `PATCH /users/@me/guilds/{id}/settings` | `{message_notifications: 0\|1\|2\|3}` |
@@ -216,7 +216,9 @@ Local only. Volumes, input mode, sensitivity, push-to-talk and per-user volume a
 
 | Action | Request | Status |
 |---|---|---|
-| Mark server/category read | `POST /read-states/ack-bulk` `{read_states:[{channel_id,message_id,read_state_type:0}]}`, max 100 per request, 1 s apart (`BULK_ACK`) | observed |
+| QR sign-in ticket exchange | `POST /users/@me/remote-auth/login` `{ticket}` -> `{encrypted_token}`; may answer 400 with `captcha_key`/`captcha_sitekey`/`captcha_rqdata`/`captcha_rqtoken`/`captcha_session_id`, retried with `X-Captcha-Key`, `X-Captcha-Rqtoken`, `X-Captcha-Session-Id` as the password login is | **capture**: the retry is inferred from the web client's generic captcha handling; not seen in the cached bundle |
+| Server Overview save | one `PATCH /guilds/{id}` `{name?, description?, icon?, banner?}` (`icon`/`banner` data URI or null) | documented API |
+| Mark server/category/folder read | `POST /read-states/ack-bulk` (a folder is one list across its servers, not a request per server) `{read_states:[{channel_id,message_id,read_state_type:0}]}`, max 100 per request, 1 s apart (`BULK_ACK`) | observed |
 | Mark channel read (menu) | `POST /channels/{c}/messages/{m}/ack` `{manual:true,mention_count:0}` | observed earlier; capture |
 | Mentions inbox | `GET /users/@me/mentions?limit=25&before&guild_id&roles=true&everyone=true` (`MENTIONS`, `fetchRecentMentions`) | observed; default flags capture |
 | Guild mute / level | `PATCH /users/@me/guilds/{g}/settings` `{muted, mute_config:{end_time,selected_time_window}}`, `{message_notifications}`, `{suppress_everyone}` | shape observed; window values 900/3600/10800/28800/86400/-1 capture |

@@ -21,6 +21,12 @@ impl Session {
             .collect()
     }
 
+    /// The unread channels of several servers (a folder), in one list so they go out as one ack.
+    pub fn unread_targets_in(&self, guilds: &[Id]) -> Vec<(Id, Id)> {
+        let mut seen = std::collections::HashSet::new();
+        guilds.iter().flat_map(|g| self.unread_targets(*g, None)).filter(|(c, _)| seen.insert(*c)).collect()
+    }
+
     /// "Mark as Read" for a server or category: one `ack-bulk` (read-state ack bodies per FIDELITY), then local state.
     pub async fn mark_read_bulk(&self, intent: UserIntent, items: Vec<(Id, Id)>) -> Result<()> {
         if items.is_empty() {

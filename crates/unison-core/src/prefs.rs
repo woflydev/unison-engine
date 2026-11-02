@@ -358,6 +358,32 @@ impl Prefs {
         );
     }
 
+    /// Drop every field that already equals `base`, leaving only what would change it. A toggle
+    /// flipped twice is then no change at all, so the Settings save bar goes away by itself.
+    pub fn retain_changes(&mut self, base: &Prefs) {
+        macro_rules! r {
+            ($($f:ident),*) => { $( if self.$f == base.$f { self.$f = None; } )* }
+        }
+        r!(
+            theme, timestamp_hour_cycle, inline_attachment_media, inline_embed_media, gif_auto_play, render_embeds,
+            render_reactions, animate_emoji, animate_stickers, message_display_compact, explicit_content_filter,
+            convert_emoticons, dm_spam_filter_v2, show_in_app_notifications, enable_burst_reaction_notifications,
+            reaction_notifications, default_guilds_restricted, friend_source_flags, default_message_request_restricted,
+            status, custom_status, show_current_game, locale, view_nsfw_guilds,
+            view_nsfw_commands, afk_timeout, stream_notifications_enabled, allow_activity_party_friends,
+            allow_activity_party_voice, inappropriate_conversation_warnings, recent_games_enabled, show_local_time
+        );
+        // The stamp only means something beside a status.
+        if self.status.is_none() {
+            self.status_created_at_ms = None;
+        }
+    }
+
+    /// Whether nothing is set.
+    pub fn is_blank(&self) -> bool {
+        *self == Prefs::default()
+    }
+
     /// Encode the `Some` fields as a partial PreloadedUserSettings: the body of
     /// `PATCH /users/@me/settings-proto/1` after base64. Empty when nothing is set.
     pub fn encode_patch(&self) -> Vec<u8> {
@@ -550,5 +576,29 @@ mod tests {
         let mut a = Prefs { theme: Some(1), locale: Some("en-US".into()), ..Default::default() };
         a.merge(&Prefs { theme: Some(2), ..Default::default() });
         assert_eq!((a.theme, a.locale.as_deref()), (Some(2), Some("en-US")));
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_flipped_back_is_no_change() {
+        let base = Prefs { animate_emoji: Some(true), theme: Some(1), ..Default::default() };
+        let mut staged = Prefs { animate_emoji: Some(false), ..Default::default() };
+        staged.retain_changes(&base);
+        assert_eq!(staged.animate_emoji, Some(false));
+        staged.merge(&Prefs { animate_emoji: Some(true), ..Default::default() });
+        staged.retain_changes(&base);
+        assert!(staged.is_blank(), "back to the saved value leaves nothing to save");
+    }
+
+    #[test]
+    fn a_status_stamp_alone_is_not_a_change() {
+        let base = Prefs { status: Some("online".into()), ..Default::default() };
+        let mut staged = Prefs { status: Some("online".into()), status_created_at_ms: Some(5), ..Default::default() };
+        staged.retain_changes(&base);
+        assert!(staged.is_blank());
     }
 }

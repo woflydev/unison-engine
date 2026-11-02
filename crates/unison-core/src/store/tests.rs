@@ -685,6 +685,28 @@ fn a_role_ping_counts_only_for_members_of_the_role() {
 }
 
 #[test]
+fn a_ping_loaded_over_rest_still_pings() {
+    use crate::model::{Channel, Member, Message};
+    let mut s = Store::default();
+    let (g, role) = (Snowflake(100), Snowflake(7));
+    s.me = Some(User { id: Snowflake(1), ..Default::default() });
+    s.my_members.insert(g, Member { roles: vec![role], ..Default::default() });
+    s.channels.insert(Snowflake(11), Channel { id: Snowflake(11), guild_id: Some(g), ..Default::default() });
+    // A REST page has no `guild_id` on its messages.
+    let rest = |roles: Vec<Snowflake>, everyone: bool| Message {
+        id: Snowflake(500),
+        channel_id: Snowflake(11),
+        author: User { id: Snowflake(2), ..Default::default() },
+        mention_roles: roles,
+        mention_everyone: everyone,
+        ..Default::default()
+    };
+    assert!(s.pings_me(&rest(vec![role], false)), "a role ping from history");
+    assert!(s.pings_me(&rest(vec![], true)), "@everyone from history");
+    assert!(!s.pings_me(&rest(vec![], false)));
+}
+
+#[test]
 fn activities_follow_presence_updates() {
     let mut s = Store::default();
     s.me = Some(User { id: Snowflake(1), ..Default::default() });

@@ -10,7 +10,8 @@ async fn main() {
     let rest = Arc::new(Rest::new(Arc::new(Transport::new(None).unwrap()), identity, Arc::new(RwLock::new(Policy::default()))));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let t = Instant::now();
-    remote_auth::start(rest, tx);
+    let (_ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+    remote_auth::start(rest, tx, crx);
     while let Some(ev) = rx.recv().await {
         println!("{:>6.1}s {:?}", t.elapsed().as_secs_f32(), ev);
     }
