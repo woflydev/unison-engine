@@ -322,6 +322,17 @@ impl LocalState {
         self.put("update_prefs", p);
     }
 
+    /// The last signed feed the updater fetched, kept so the "update available" badge is there at the
+    /// next launch (and every one after) until the person updates, not only on the day of the check.
+    /// It is verified again before it is used, like a fresh one.
+    pub fn cached_appcast(&self) -> Option<String> {
+        self.get("update_feed")
+    }
+
+    pub fn set_cached_appcast(&self, signed_json: &str) {
+        self.put("update_feed", &signed_json.to_string());
+    }
+
     // ----- Accounts -----
 
     pub fn account_order(&self) -> Vec<String> {

@@ -116,6 +116,15 @@ impl UnisonEngine {
         self.inner.local.update_prefs().check_due(now_ms())
     }
 
+    /// The last signed feed that was fetched; the shell verifies it again before offering it.
+    pub fn cached_appcast(&self) -> Option<String> {
+        self.inner.local.cached_appcast()
+    }
+
+    pub fn cache_appcast(&self, signed_json: String) {
+        self.inner.local.set_cached_appcast(&signed_json);
+    }
+
     /// Note that the feed was just asked.
     pub fn record_update_check(&self) {
         let mut p = self.inner.local.update_prefs();

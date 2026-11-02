@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "unison-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "aes-gcm",
  "audiopus_sys",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "unison-etf"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3681,7 +3681,7 @@ dependencies = [
 
 [[package]]
 name = "unison-ffi"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "parking_lot 0.12.5",
  "serde_json",
@@ -3695,11 +3695,11 @@ dependencies = [
 
 [[package]]
 name = "unison-markdown"
-version = "0.3.4"
+version = "0.3.5"
 
 [[package]]
 name = "unison-watcher"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

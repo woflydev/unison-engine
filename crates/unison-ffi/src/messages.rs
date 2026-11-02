@@ -396,6 +396,18 @@ pub(crate) fn rich(s: &Store, guild: Option<Id>, src: &str) -> RichText {
     }
 }
 
+/// "A, B, C and 9 others" for a card that shows the emoji itself (the same rule as the hover sentence).
+#[uniffi::export]
+pub fn reaction_names_line(names: Vec<String>, total: u32) -> String {
+    unison_core::reaction_info::names_line(&names, total)
+}
+
+/// The `:name:` Discord writes a unicode emoji as (`skull` for 💀), if it has one.
+#[uniffi::export]
+pub fn emoji_shortcode(emoji: String) -> Option<String> {
+    unison_core::emoji::shortcode(&emoji).map(str::to_string)
+}
+
 pub(crate) fn reaction_emojis(s: &Store) -> ReactionEmojis {
     let Some(prefs) = &s.emoji_prefs else {
         return ReactionEmojis::default();
@@ -1045,6 +1057,8 @@ pub struct ReactionUserItem {
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct ReactionWho {
     pub summary: String,
+    /// Just the people ("A, B, C and 9 others"), for a card that shows the emoji itself.
+    pub names_line: String,
     pub users: Vec<ReactionUserItem>,
 }
 
@@ -1061,6 +1075,7 @@ impl UnisonEngine {
         let store = s.store.read();
         Ok(ReactionWho {
             summary: unison_core::reaction_info::summary(&names, total, &label),
+            names_line: unison_core::reaction_info::names_line(&names, total),
             users: people
                 .into_iter()
                 .map(|(uid, name)| ReactionUserItem { user_id: uid.to_string(), name, avatar_url: store.users.get(&uid).map(|u| u.avatar_url(64)).unwrap_or_default() })
