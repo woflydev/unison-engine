@@ -10,6 +10,10 @@ pub struct ComfortItem {
     pub clean_links: bool,
     pub confirm_everyone: bool,
     pub strip_location: bool,
+    /// Videos open full size over the dimmed window; off plays them in place.
+    pub video_viewer: bool,
+    /// HDR videos play in standard range (no brightening of the display).
+    pub video_sdr: bool,
     /// Trim an overlong message (the same three-way choice as compression).
     pub trim_choice: crate::uploads::CompressChoice,
     /// Comma-separated. Read-only: the list is edited with `add_keywords` / `remove_keyword`.
@@ -71,6 +75,8 @@ fn to_item(c: &Comfort) -> ComfortItem {
         clean_links: c.clean_links,
         confirm_everyone: c.confirm_everyone,
         strip_location: c.strip_location,
+        video_viewer: c.video_viewer,
+        video_sdr: c.video_sdr,
         trim_choice: match c.trim_long {
             None => crate::uploads::CompressChoice::Automatic,
             Some(true) => crate::uploads::CompressChoice::On,
@@ -129,6 +135,8 @@ impl UnisonEngine {
             clean_links: item.clean_links,
             confirm_everyone: item.confirm_everyone,
             strip_location: item.strip_location,
+            video_viewer: item.video_viewer,
+            video_sdr: item.video_sdr,
             trim_long: match item.trim_choice {
                 crate::uploads::CompressChoice::Automatic => None,
                 crate::uploads::CompressChoice::On => Some(true),

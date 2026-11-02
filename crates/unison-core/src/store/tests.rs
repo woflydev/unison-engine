@@ -71,7 +71,7 @@ fn messages_mentions_and_pending_echo() {
     let ch = Snowflake(11);
     s.set_history_latest(ch, vec![], false);
     let nonce = Snowflake::nonce_now();
-    s.push_pending(ch, "hi".into(), nonce);
+    s.push_pending(ch, "hi".into(), nonce, None);
     assert_eq!(s.history[&ch].messages.len(), 1);
 
     let mine = json!({"id": "501", "channel_id": "11", "guild_id": "100", "author": {"id": "1", "username": "me"},
@@ -89,6 +89,23 @@ fn messages_mentions_and_pending_echo() {
     let d = s.apply("MESSAGE_ACK", &term(json!({"channel_id": "11", "message_id": "502", "mention_count": 0}))).unwrap();
     assert_eq!(d, vec![Delta::ReadState { channel: ch }]);
     assert!(!s.is_unread(&s.channels[&ch]));
+}
+
+#[test]
+fn a_replys_echo_has_its_reply_line_from_the_start() {
+    let mut s = store();
+    let ch = Snowflake(11);
+    let orig = json!({"id": "7", "channel_id": "11", "author": {"id": "2", "username": "alice"}, "content": "", "timestamp": "t",
+                      "attachments": [{"id": "9", "filename": "a.png", "content_type": "image/png", "size": 1, "url": "u", "proxy_url": "u"}]});
+    s.set_history_latest(ch, vec![serde_json::from_value(orig).unwrap()], false);
+    s.push_pending(ch, "nice".into(), Snowflake::nonce_now(), Some(Snowflake(7)));
+    let echo = s.history[&ch].messages.back().unwrap();
+    assert_eq!(echo.id, Snowflake(0));
+    assert_eq!(echo.kind, message_type::REPLY);
+    assert_eq!(echo.referenced_message.as_ref().map(|r| r.id), Some(Snowflake(7)));
+    // An original that is not loaded: a plain echo (the confirmed message brings the line).
+    s.push_pending(ch, "x".into(), Snowflake::nonce_now(), Some(Snowflake(999)));
+    assert!(s.history[&ch].messages.back().unwrap().referenced_message.is_none());
 }
 
 #[test]

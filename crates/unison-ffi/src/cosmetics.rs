@@ -80,3 +80,9 @@ pub fn name_gradient(colors: Vec<u32>, count: u32) -> Vec<u32> {
 pub fn sticker_should_play(setting: u32, reduce_motion: bool, visible: bool, hovered: bool) -> bool {
     unison_core::sticker_motion::should_play(setting, reduce_motion, visible, hovered)
 }
+
+/// Whether an animated custom emoji plays now (setting, Reduce Motion, on screen, app in front).
+#[uniffi::export]
+pub fn emoji_should_play(setting: bool, reduce_motion: bool, visible: bool, app_active: bool) -> bool {
+    unison_core::sticker_motion::emoji_should_play(setting, reduce_motion, visible, app_active)
+}

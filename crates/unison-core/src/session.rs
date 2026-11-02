@@ -1141,7 +1141,7 @@ impl Session {
                 )));
             }
             crate::send_rules::check_final(&named, premium, tier).map_err(Error::Refused)?;
-            self.store.write().push_pending(channel, content.clone(), nonce);
+            self.store.write().push_pending(channel, content.clone(), nonce, reply_to);
             // An insert, not a reset: the local echo (id 0) arrives in the transcript like any new
             // message (fade and glide, UI.md 2b.12) instead of a full reload. Not persisted: only
             // gateway dispatches mark history dirty.
@@ -1333,10 +1333,12 @@ impl Session {
     pub async fn react(&self, intent: UserIntent, channel: Id, message: Id, emoji: String, add: bool) -> Result<()> {
         let shown = self.store.write().apply_own_reaction(channel, message, &emoji, add);
         let applied = !shown.is_empty();
+        tracing::debug!(target: "unison_core::react", add, applied, "own reaction shown");
         if applied {
             (self.emit)(SessionEvent::Deltas(shown));
         }
         let result = self.rest.react(intent, channel, message, &emoji, add).await;
+        tracing::debug!(target: "unison_core::react", ok = result.is_ok(), error = ?result.as_ref().err().map(|e| e.user_message()), "reaction request answered");
         if result.is_err() && applied {
             let undone = self.store.write().apply_own_reaction(channel, message, &emoji, !add);
             if !undone.is_empty() {
@@ -2249,6 +2251,41 @@ mod send_tests {
         assert!(state.error.as_deref().unwrap().contains("2000"));
         assert!(st.history.get(&Snowflake(11)).is_none_or(|h| h.messages.iter().all(|m| m.id.0 != 0)), "no stuck echo");
         assert!(seen.lock().iter().any(|d| matches!(d, Delta::Sends { channel } if *channel == Snowflake(11))));
+    }
+
+    #[tokio::test]
+    async fn a_reaction_is_emitted_at_once_before_the_request_is_answered() {
+        let (s, seen) = session();
+        let m = serde_json::json!({"id": "5", "channel_id": "11", "author": {"id": "2"}, "content": "x", "timestamp": "t"});
+        s.store.write().set_history_latest(Snowflake(11), vec![serde_json::from_value(m).unwrap()], false);
+        let s2 = s.clone();
+        let task = tokio::spawn(async move { s2.react(intent(), Snowflake(11), Snowflake(5), "👍".into(), true).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(seen.lock().iter().any(|d| matches!(d, Delta::MessageUpdated { message, .. } if *message == Snowflake(5))), "no delta for the optimistic reaction");
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn gateway_reactions_reach_the_ui_even_in_a_burst() {
+        let (s, seen) = session();
+        let m = serde_json::json!({"id": "5", "channel_id": "11", "author": {"id": "2"}, "content": "x", "timestamp": "t"});
+        s.store.write().set_history_latest(Snowflake(11), vec![serde_json::from_value(m).unwrap()], false);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let p = s.clone();
+        tokio::spawn(async move { p.pump(rx).await });
+        let ev = |user: &str, emoji: &str| {
+            let v = serde_json::json!({"user_id": user, "channel_id": "11", "message_id": "5", "emoji": {"name": emoji}});
+            GatewayEvent::Dispatch { name: "MESSAGE_REACTION_ADD".into(), data: unison_etf::encode_value(&v)[1..].to_vec() }
+        };
+        tx.send(ev("2", "👍")).unwrap();
+        tx.send(ev("3", "👍")).unwrap();
+        tx.send(ev("4", "🔥")).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let n = seen.lock().iter().filter(|d| matches!(d, Delta::MessageUpdated { .. })).count();
+        assert!(n >= 1, "no delta reached the UI");
+        let st = s.store.read();
+        let counts: Vec<u32> = st.history[&Snowflake(11)].messages[0].reactions.iter().map(|r| r.count).collect();
+        assert_eq!(counts, vec![2, 1]);
     }
 
     #[tokio::test]

@@ -12,9 +12,24 @@ pub fn should_play(setting: u32, reduce_motion: bool, visible: bool, hovered: bo
     }
 }
 
+/// Whether an animated custom emoji moves now: the "Animated emoji" setting, Reduce Motion, on screen and
+/// the app in front (nothing moves in a window nobody is looking at).
+pub fn emoji_should_play(setting: bool, reduce_motion: bool, visible: bool, app_active: bool) -> bool {
+    setting && !reduce_motion && visible && app_active
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_play;
+    use super::{emoji_should_play, should_play};
+
+    #[test]
+    fn emoji_move_only_when_allowed_seen_and_in_front() {
+        assert!(emoji_should_play(true, false, true, true));
+        assert!(!emoji_should_play(false, false, true, true));
+        assert!(!emoji_should_play(true, true, true, true));
+        assert!(!emoji_should_play(true, false, false, true));
+        assert!(!emoji_should_play(true, false, true, false));
+    }
 
     #[test]
     fn setting_visibility_and_reduce_motion() {

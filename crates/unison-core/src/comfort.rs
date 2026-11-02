@@ -31,11 +31,17 @@ pub struct Comfort {
     pub trim_long: Option<bool>,
     /// No banners or sounds in this window; unread counts and badges still update.
     pub quiet: Option<QuietHours>,
+    /// A click on a video opens it full size over the dimmed window (on, the default) instead of playing it
+    /// in place inside the message.
+    pub video_viewer: bool,
+    /// Play HDR videos mapped to standard range, so the display does not brighten while they play. Off by default:
+    /// HDR plays as made.
+    pub video_sdr: bool,
 }
 
 impl Default for Comfort {
     fn default() -> Self {
-        Self { clean_links: true, confirm_everyone: true, strip_location: true, keywords: vec![], trim_long: None, quiet: None }
+        Self { clean_links: true, confirm_everyone: true, strip_location: true, keywords: vec![], trim_long: None, quiet: None, video_viewer: true, video_sdr: false }
     }
 }
 
@@ -382,6 +388,14 @@ pub fn export_text(title: &str, rows: &[ExportRow]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn videos_open_in_the_viewer_unless_turned_off() {
+        assert!(Comfort::default().video_viewer);
+        // Settings saved before the option existed keep the default.
+        let old: Comfort = serde_json::from_str(r#"{"clean_links":false}"#).unwrap();
+        assert!(old.video_viewer && !old.clean_links && !old.video_sdr);
+    }
+
     use super::*;
 
     #[test]

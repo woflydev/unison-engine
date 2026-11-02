@@ -1128,3 +1128,19 @@ mod resolve_tests {
         assert_eq!(preview_text(&s, None, "<@&9>", 80), "@deleted-role", "a role that really is gone");
     }
 }
+
+/// Where to scroll for a jump to a loaded message (`unison_core::jump_scroll`): `None` when the
+/// message is already comfortably in view (only highlight it), otherwise the offset that centres it,
+/// kept inside what the transcript can scroll to. Document points, y down; the insets are what
+/// floats over the viewport's top and bottom.
+#[uniffi::export]
+pub fn jump_scroll_target(row_top: f64, row_bottom: f64, offset: f64, viewport: f64, inset_top: f64, inset_bottom: f64, content: f64) -> Option<f64> {
+    unison_core::jump_scroll::target_offset(&unison_core::jump_scroll::Geometry { row_top, row_bottom, offset, viewport, inset_top, inset_bottom, content })
+}
+
+/// Whether `rows` new rows (`screens` viewport heights tall together) arrive with motion or swap in
+/// (`unison_core::arrival`): live messages and the unread ones fetched after a channel opens.
+#[uniffi::export]
+pub fn arrival_animates(rows: u32, screens: f64) -> bool {
+    unison_core::arrival::animates(rows, screens)
+}

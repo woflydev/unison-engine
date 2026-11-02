@@ -1765,11 +1765,23 @@ impl Store {
         h.has_more_before = full_page;
     }
 
-    /// Insert a pending local echo (id 0) that MESSAGE_CREATE will replace by nonce.
-    pub fn push_pending(&mut self, channel: Id, content: String, nonce: Snowflake) {
+    /// Insert a pending local echo (id 0) that MESSAGE_CREATE will replace by nonce. A reply's echo
+    /// carries the same reply line the confirmed message will have (the original, when it is loaded),
+    /// so the row has its final height from the first frame and the line never pops in when the
+    /// message is confirmed (UX.md 5.6).
+    pub fn push_pending(&mut self, channel: Id, content: String, nonce: Snowflake, reply_to: Option<Id>) {
         let Some(me) = self.me.clone() else { return };
         let h = self.history.entry(channel).or_default();
+        let original = reply_to.and_then(|id| h.messages.iter().find(|m| m.id == id)).map(|m| {
+            let mut o = m.clone();
+            o.referenced_message = None;
+            Box::new(o)
+        });
+        let reference = original.as_ref().zip(reply_to).map(|(_, id)| MessageReference { message_id: Some(id), channel_id: Some(channel), ..Default::default() });
         h.messages.push_back(Message {
+            kind: if original.is_some() { message_type::REPLY } else { Default::default() },
+            message_reference: reference,
+            referenced_message: original,
             id: Snowflake(0),
             channel_id: channel,
             author: me,
