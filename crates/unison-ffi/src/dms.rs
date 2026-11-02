@@ -55,7 +55,7 @@ pub(crate) fn dm_item(s: &Store, c: &Channel) -> DmItem {
             .then(|| c.recipient_ids.first().and_then(|u| presence::row_activity(s.user_activities(*u))))
             .flatten(),
         status: (c.kind == channel_type::DM)
-            .then(|| c.recipient_ids.first().map(|u| s.presence(*u).to_string()))
+            .then(|| c.recipient_ids.first().map(|u| s.status_of(*u, None)))
             .flatten(),
     }
 }
@@ -104,7 +104,7 @@ impl UnisonEngine {
                     user_id: u.to_string(),
                     name: s.display_name(None, u),
                     avatar_url: s.users.get(&u).map(|x| x.avatar_url(64)).unwrap_or_default(),
-                    status: if Some(u) == me { if s.my_status.is_empty() { "online".into() } else { s.my_status.clone() } } else { s.presence(u).to_string() },
+                    status: s.status_of(u, None),
                     is_owner: c.owner_id == Some(u),
                     is_me: Some(u) == me,
                 })

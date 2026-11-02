@@ -334,7 +334,7 @@ impl UnisonEngine {
                 .filter(|r| r.kind == 1)
                 .map(|r| {
                     let u = r.user_id.or(r.user.as_ref().map(|u| u.id)).unwrap_or(r.id);
-                    FriendStatus { user_id: u.to_string(), status: s.presence(u).to_string() }
+                    FriendStatus { user_id: u.to_string(), status: s.status_of(u, None) }
                 })
                 .collect()
         })

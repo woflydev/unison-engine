@@ -1099,6 +1099,21 @@ impl Store {
         self.presences.get(&user).copied().unwrap_or("offline")
     }
 
+    /// What to show as `user`'s status anywhere a person is drawn (profile card, full profile, DM list, friends):
+    /// your own status for you; for someone else the status their server's member list reports when `guild` has
+    /// one, otherwise the status the account has been told about (friends, DMs, other servers). One answer for
+    /// every surface, so the DM list and the profile never disagree.
+    pub fn status_of(&self, user: Id, guild: Option<Id>) -> String {
+        if Some(user) == self.my_id() {
+            return if self.my_status.is_empty() { "online".into() } else { self.my_status.clone() };
+        }
+        guild
+            .and_then(|g| self.member_lists.get(&g))
+            .and_then(|l| l.items.iter().filter_map(|i| i.member.as_ref()).find(|m| m.member.user.as_ref().map(|x| x.id) == Some(user)))
+            .and_then(|m| m.presence.as_ref().map(|p| p.status.clone()))
+            .unwrap_or_else(|| self.presence(user).to_string())
+    }
+
     fn is_dm_recipient(&self, user: Id) -> bool {
         self.private_channels
             .iter()

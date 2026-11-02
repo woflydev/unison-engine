@@ -170,11 +170,16 @@ impl UpdatePrefs {
         if self.beta { "beta" } else { "stable" }
     }
 
-    /// The launch check runs only when it is on and a day has passed since the last one.
+    /// The automatic check runs only when it is on and `CHECK_INTERVAL_MS` has passed since the last one.
     pub fn check_due(&self, now_ms: u64) -> bool {
-        self.auto_check && (self.last_check_ms == 0 || now_ms.saturating_sub(self.last_check_ms) >= 86_400_000)
+        self.auto_check && (self.last_check_ms == 0 || now_ms.saturating_sub(self.last_check_ms) >= CHECK_INTERVAL_MS)
     }
 }
+
+/// How long the automatic check waits before asking again: a few hours, not a day, so a release published after
+/// this morning's check is offered this afternoon. The feed is one small signed file on our own host (not a
+/// Discord request), asked only at launch and when the app comes to the front, never on a timer.
+pub const CHECK_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
 
 pub fn feed_url(base: &str, channel: &str) -> String {
     if norm_channel(channel) == STABLE {
@@ -228,9 +233,9 @@ pub fn evaluate(signed_json: &str, public_key_b64: &str, platform: &Platform, cu
 #[cfg(test)]
 mod tests {
     #[test]
-    fn launch_check_waits_a_day_and_respects_the_switch() {
+    fn automatic_check_waits_hours_and_respects_the_switch() {
         use super::UpdatePrefs;
-        let day = 86_400_000;
+        let day = super::CHECK_INTERVAL_MS;
         let mut p = UpdatePrefs::default();
         assert!(p.check_due(5));
         p.last_check_ms = 1_000;
@@ -238,6 +243,7 @@ mod tests {
         assert!(p.check_due(1_000 + day));
         p.auto_check = false;
         assert!(!p.check_due(1_000 + 10 * day));
+        assert!(super::CHECK_INTERVAL_MS < 86_400_000, "a release is offered the same day");
         assert_eq!(UpdatePrefs { beta: true, ..Default::default() }.channel(), "beta");
     }
 

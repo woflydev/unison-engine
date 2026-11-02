@@ -99,22 +99,7 @@ impl ProfileItem {
 
 pub(crate) fn local_profile(s: &Store, user: Id, guild: Option<Id>) -> Option<ProfileItem> {
     let u = s.users.get(&user)?;
-    let status = guild
-        .and_then(|g| s.member_lists.get(&g))
-        .and_then(|l| {
-            l.items
-                .iter()
-                .filter_map(|i| i.member.as_ref())
-                .find(|m| m.member.user.as_ref().map(|x| x.id) == Some(user))
-        })
-        .and_then(|m| m.presence.as_ref().map(|p| p.status.clone()))
-        .unwrap_or_else(|| {
-            if Some(user) == s.my_id() {
-                s.my_status.clone()
-            } else {
-                "offline".into()
-            }
-        });
+    let status = s.status_of(user, guild);
     let roles = match (guild, guild.and_then(|g| s.members.get(&(g, user)))) {
         (Some(g), Some(m)) => {
             let all = s.roles.get(&g);

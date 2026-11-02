@@ -111,7 +111,7 @@ impl UnisonEngine {
         self.inner.local.update_prefs().channel().into()
     }
 
-    /// Whether the launch check should run now (on, and a day since the last).
+    /// Whether the launch check should run now (on, and the check interval since the last).
     pub fn update_check_due(&self) -> bool {
         self.inner.local.update_prefs().check_due(now_ms())
     }

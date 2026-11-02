@@ -362,6 +362,10 @@ fn dm_presence_from_supplemental_and_updates() {
     // Never track ourselves from presence events.
     s.apply("PRESENCE_UPDATE", &term(json!({"user": {"id": "1"}, "status": "idle"}))).unwrap();
     assert_eq!(s.presence(Snowflake(1)), "offline");
+    // Every surface asks `status_of`: someone known only from a DM or the friends list (no member list) shows
+    // what they really are, not "offline" (the profile card said so while the DM list said online).
+    assert_eq!(s.status_of(Snowflake(9), None), "idle");
+    assert_eq!(s.status_of(Snowflake(9), Some(Snowflake(100))), "idle", "a server with no member list for them falls back to what is known");
 }
 
 #[test]
