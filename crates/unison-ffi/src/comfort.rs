@@ -10,6 +10,8 @@ pub struct ComfortItem {
     pub clean_links: bool,
     pub confirm_everyone: bool,
     pub strip_location: bool,
+    /// HEIC and HEIF photos go up as JPEG.
+    pub convert_heic: bool,
     /// Videos open full size over the dimmed window; off plays them in place.
     pub video_viewer: bool,
     /// HDR videos play in standard range (no brightening of the display).
@@ -75,6 +77,7 @@ fn to_item(c: &Comfort) -> ComfortItem {
         clean_links: c.clean_links,
         confirm_everyone: c.confirm_everyone,
         strip_location: c.strip_location,
+        convert_heic: c.convert_heic,
         video_viewer: c.video_viewer,
         video_sdr: c.video_sdr,
         trim_choice: match c.trim_long {
@@ -135,6 +138,7 @@ impl UnisonEngine {
             clean_links: item.clean_links,
             confirm_everyone: item.confirm_everyone,
             strip_location: item.strip_location,
+            convert_heic: item.convert_heic,
             video_viewer: item.video_viewer,
             video_sdr: item.video_sdr,
             trim_long: match item.trim_choice {

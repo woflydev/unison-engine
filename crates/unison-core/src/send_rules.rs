@@ -187,7 +187,7 @@ pub fn check(text: &str, files: &[FileMeta], acct: &Account) -> Verdict {
         if f.size <= limit {
             continue;
         }
-        let shrinkable = !matches!(upload_policy::plan(true, limit, f.size, &f.content_type), upload_policy::Plan::Keep);
+        let shrinkable = !matches!(upload_policy::plan(true, false, limit, f.size, &f.content_type), upload_policy::Plan::Keep);
         let head = format!("{} is {}; the limit here is {}.", f.name, size(f.size), size(limit));
         if shrinkable && acct.compress {
             continue;

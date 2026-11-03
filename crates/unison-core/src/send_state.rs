@@ -45,6 +45,32 @@ pub struct SendState {
 /// How often the speed is re-measured. Shorter windows make the ETA jump around.
 const SAMPLE: Duration = Duration::from_millis(400);
 
+/// Upload progress gathered between updates. A 256 KiB piece lands many times a second on a fast link; the
+/// store is written, and the shells told, about ten times a second with what came in meanwhile.
+#[derive(Debug)]
+pub struct ProgressBatch {
+    pending: Vec<u64>,
+    last: Instant,
+}
+
+impl ProgressBatch {
+    pub fn new(files: usize, now: Instant) -> Self {
+        Self { pending: vec![0; files], last: now }
+    }
+
+    /// Note `bytes` through for file `index`. Returns what to apply when a tenth of a second has passed.
+    pub fn push(&mut self, index: usize, bytes: u64, now: Instant) -> Option<Vec<u64>> {
+        if let Some(p) = self.pending.get_mut(index) {
+            *p += bytes;
+        }
+        if now.saturating_duration_since(self.last) < Duration::from_millis(100) {
+            return None;
+        }
+        self.last = now;
+        Some(self.pending.iter_mut().map(std::mem::take).collect())
+    }
+}
+
 impl SendState {
     pub fn new(nonce: Snowflake, channel: Id, files: Vec<(String, u64)>, now: Instant) -> Self {
         let uploading = !files.is_empty();
@@ -133,6 +159,20 @@ mod tests {
         let t0 = Instant::now();
         let f = files.iter().enumerate().map(|(i, s)| (format!("f{i}"), *s)).collect();
         (SendState::new(Snowflake(1), Snowflake(2), f, t0), t0)
+    }
+
+    #[test]
+    fn progress_is_applied_in_tenths_of_a_second_without_losing_bytes() {
+        let t0 = Instant::now();
+        let mut b = ProgressBatch::new(2, t0);
+        assert_eq!(b.push(0, 100, t0 + Duration::from_millis(10)), None);
+        assert_eq!(b.push(1, 50, t0 + Duration::from_millis(60)), None);
+        assert_eq!(b.push(0, 25, t0 + Duration::from_millis(120)), Some(vec![125, 50]));
+        // What was handed out is not handed out again.
+        assert_eq!(b.push(1, 5, t0 + Duration::from_millis(130)), None);
+        assert_eq!(b.push(1, 5, t0 + Duration::from_millis(240)), Some(vec![0, 10]));
+        // A file index that doesn't exist is ignored, not a panic.
+        assert_eq!(b.push(9, 1, t0 + Duration::from_millis(400)), Some(vec![0, 0]));
     }
 
     #[test]

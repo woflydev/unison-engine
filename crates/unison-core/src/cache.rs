@@ -26,6 +26,10 @@ const FTS_VERSION: &[u8] = b"3";
 
 pub struct Cache {
     conn: Mutex<Connection>,
+    /// A second, read-only connection to the same file (WAL lets readers run beside the writer), so
+    /// a cached page for a channel being opened never waits behind a flush. None for in-memory
+    /// caches, which have one connection.
+    reader: Option<Mutex<Connection>>,
     codec: Mutex<Codec>,
     /// Size the cache may use, in bytes (0: no limit), and messages kept per channel.
     budget: AtomicU64,
@@ -95,7 +99,17 @@ pub struct LocalPage {
 impl Cache {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        let mut cache = Self::init(conn)?;
+        cache.reader = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .and_then(|c| c.execute_batch("PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY;").map(|_| c))
+            .ok()
+            .map(Mutex::new);
+        Ok(cache)
+    }
+
+    /// The connection for reads: the reader when there is one, else the only connection.
+    fn rd(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.reader.as_ref().unwrap_or(&self.conn).lock()
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -121,6 +135,7 @@ impl Cache {
         Self::migrate_fts(&conn, &mut codec)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            reader: None,
             codec: Mutex::new(codec),
             budget: AtomicU64::new(0),
             per_channel: AtomicI64::new(DISK_MESSAGES_PER_CHANNEL),
@@ -163,7 +178,7 @@ impl Cache {
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.conn.lock().query_row("SELECT v FROM kv WHERE k = ?1", [key], |r| r.get(0)).optional()?)
+        Ok(self.rd().query_row("SELECT v FROM kv WHERE k = ?1", [key], |r| r.get(0)).optional()?)
     }
 
     pub fn put(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -188,7 +203,16 @@ impl Cache {
 
     /// Snapshot of guilds/channels/read states, zstd-compressed JSON.
     pub fn save_store(&self, store: &Store) -> Result<()> {
-        let json = serde_json::to_vec(store)?;
+        self.save_store_json(Self::store_json(store)?)
+    }
+
+    /// The store as JSON. The only step that needs the store; hashing, compressing and writing
+    /// (`save_store_json`) happen after the caller has let go of it.
+    pub fn store_json(store: &Store) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(store)?)
+    }
+
+    pub fn save_store_json(&self, json: Vec<u8>) -> Result<()> {
         let h = hash_bytes(&json);
         if self.written.lock().get("store") == Some(&h) {
             return Ok(());
@@ -342,7 +366,7 @@ impl Cache {
 
     /// Bytes the cache holds right now (live pages, not counting space waiting to be reused).
     pub fn used_bytes(&self) -> Result<u64> {
-        let conn = self.conn.lock();
+        let conn = self.rd();
         let (pages, free, size): (i64, i64, i64) = conn.query_row(
             "SELECT (SELECT page_count FROM pragma_page_count), (SELECT freelist_count FROM pragma_freelist_count), (SELECT page_size FROM pragma_page_size)",
             [],
@@ -352,7 +376,7 @@ impl Cache {
     }
 
     pub fn message_count(&self) -> Result<u64> {
-        Ok(self.conn.lock().query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))? as u64)
+        Ok(self.rd().query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))? as u64)
     }
 
     /// `bytes` of room (0: no limit) and `per_channel` messages kept for each channel.
@@ -413,7 +437,7 @@ impl Cache {
 
     /// Newest first, like the REST endpoint.
     pub fn load_messages(&self, channel: Id, limit: u32) -> Result<Vec<Message>> {
-        let conn = self.conn.lock();
+        let conn = self.rd();
         let mut q = conn.prepare_cached("SELECT data FROM messages WHERE channel = ?1 ORDER BY id DESC LIMIT ?2")?;
         let rows = q.query_map(params![channel.0 as i64, limit], |r| r.get::<_, Vec<u8>>(0))?;
         let mut codec = self.codec.lock();
@@ -424,7 +448,7 @@ impl Cache {
     /// first, when `message` itself is stored; empty otherwise. A jump to a message we have seen
     /// before can paint this window at once instead of waiting for `?around=`.
     pub fn load_around(&self, channel: Id, message: Id, half: u32) -> Result<Vec<Message>> {
-        let conn = self.conn.lock();
+        let conn = self.rd();
         let read = |sql: &str, limit: u32| -> Result<Vec<Message>> {
             let mut q = conn.prepare_cached(sql)?;
             let rows = q.query_map(params![channel.0 as i64, message.0 as i64, limit], |r| r.get::<_, Vec<u8>>(0))?;
@@ -488,7 +512,7 @@ impl Cache {
             args.push(format!("%{}%", a.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")).into());
         }
         let wh = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh.join(" AND ")) };
-        let conn = self.conn.lock();
+        let conn = self.rd();
         let mut st = conn.prepare_cached(&format!("SELECT rowid, channel, author, content FROM messages_fts{wh} ORDER BY rowid DESC LIMIT {} OFFSET {}", q.limit, q.offset))?;
         let rows = st.query_map(rusqlite::params_from_iter(args.iter()), |r| {
             Ok(LocalHit { message: Snowflake(r.get::<_, i64>(0)? as u64), channel: Snowflake(r.get::<_, i64>(1)? as u64), author: r.get(2)?, content: r.get(3)?, full: None })
@@ -669,6 +693,41 @@ mod tests {
         let t = Instant::now();
         c.search_page(&scoped).unwrap();
         println!("3-channel scope: {} us", t.elapsed().as_micros());
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("unison-cache-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("cache.sqlite")
+    }
+
+    #[test]
+    fn a_file_cache_reads_on_its_own_connection_and_sees_every_commit() {
+        let path = temp_db("reader");
+        let c = Cache::open(&path).unwrap();
+        assert!(c.reader.is_some(), "a file cache has a read connection");
+        c.save_messages(Snowflake(1), &[msg_in(1, 10, "bob", "hello"), msg_in(1, 11, "bob", "again")]).unwrap();
+        c.put("k", b"v").unwrap();
+        assert_eq!(c.load_messages(Snowflake(1), 50).unwrap().len(), 2);
+        assert_eq!(c.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(c.search_page(&q("hello")).unwrap().total, 1);
+        assert_eq!(c.message_count().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_read_does_not_wait_for_a_write_in_progress() {
+        let path = temp_db("nowait");
+        let c = Cache::open(&path).unwrap();
+        c.save_messages(Snowflake(1), &[msg_in(1, 10, "bob", "hello")]).unwrap();
+        // Hold the writer the way a flush does; the cached page for a channel being opened still loads.
+        let writer = c.conn.lock();
+        let t = std::time::Instant::now();
+        assert_eq!(c.load_messages(Snowflake(1), 50).unwrap().len(), 1);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+        drop(writer);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

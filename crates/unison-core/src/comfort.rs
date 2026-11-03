@@ -23,6 +23,8 @@ pub struct Comfort {
     pub confirm_everyone: bool,
     /// Remove GPS data from photos before they upload.
     pub strip_location: bool,
+    /// Turn HEIC and HEIF photos into JPEG before they upload, as the web client does (Discord shows no preview of HEIC).
+    pub convert_heic: bool,
     /// Words that raise a notification like a mention does (lowercase, whole words).
     pub keywords: Vec<String>,
     /// Trim a message that is over the length limit instead of refusing it: `Some(true)` always,
@@ -41,7 +43,7 @@ pub struct Comfort {
 
 impl Default for Comfort {
     fn default() -> Self {
-        Self { clean_links: true, confirm_everyone: true, strip_location: true, keywords: vec![], trim_long: None, quiet: None, video_viewer: true, video_sdr: false }
+        Self { clean_links: true, confirm_everyone: true, strip_location: true, convert_heic: true, keywords: vec![], trim_long: None, quiet: None, video_viewer: true, video_sdr: false }
     }
 }
 

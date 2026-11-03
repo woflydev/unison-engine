@@ -37,6 +37,23 @@ pub struct LocalFile {
     pub description: Option<String>,
     pub spoiler: bool,
     pub voice: Option<VoiceMeta>,
+    /// Set when the shell changed the file before upload (converted or shrunk it): what it was.
+    pub original: Option<OriginalFile>,
+}
+
+/// What a converted or shrunk file was before: the web client sends its content type with the slot request
+/// and an `X-Discord-Original-MD5` header carrying the MD5 of the original bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OriginalFile {
+    pub content_type: String,
+    /// 32 lowercase hex digits.
+    pub md5: String,
+}
+
+/// MD5 of `bytes` as 32 lowercase hex digits (the web client's `original MD5`).
+pub fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -111,16 +128,31 @@ pub(crate) fn attachment_json(i: usize, a: &UploadedAttachment) -> Value {
     Value::Object(v)
 }
 
+/// One slot request, as the web client's `getUploadPayload` builds it: name, size, a counter id and `is_clip`.
+/// (`original_content_type` is sent only for a file the client compressed or converted first.)
+fn slot_request(file: &LocalFile) -> Value {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut v = json!({ "filename": file.filename, "file_size": file.bytes.len(), "id": id.to_string(), "is_clip": false });
+    if let Some(o) = &file.original {
+        v["original_content_type"] = o.content_type.clone().into();
+    }
+    v
+}
+
 impl Rest {
     pub async fn messages(
         &self,
         channel: Id,
         before: Option<Id>,
         limit: u8,
+        preload: bool,
     ) -> Result<Vec<Message>> {
-        let path = match before {
-            Some(b) => format!("/channels/{channel}/messages?before={b}&limit={limit}"),
-            None => format!("/channels/{channel}/messages?limit={limit}"),
+        // `preload=true` marks the read the official client makes on mouse-down (FIDELITY "Channel open").
+        let path = match (before, preload) {
+            (Some(b), _) => format!("/channels/{channel}/messages?before={b}&limit={limit}"),
+            (None, true) => format!("/channels/{channel}/messages?limit={limit}&preload=true"),
+            (None, false) => format!("/channels/{channel}/messages?limit={limit}"),
         };
         self.get(&path).await
     }
@@ -284,9 +316,10 @@ impl Rest {
         Ok(())
     }
 
-    /// Two-step upload: reserve slots, PUT bytes to the returned URLs. Returns refs for `send_message`.
-    /// `progress(file_index, bytes)` hears about every piece sent; setting `cancel` stops the
-    /// upload with [`Error::Cancelled`].
+    /// Two-step upload as the web client does it: every file asks for its own slot (`POST /channels/{id}/attachments`
+    /// with one file in `files`) and then `PUT`s its bytes, all files at once (`Promise.all` over the uploads in the
+    /// bundle). Returns refs for `send_message`. `progress(file_index, bytes)` hears about every piece sent; setting
+    /// `cancel` stops the upload with [`Error::Cancelled`].
     pub async fn upload_attachments(
         &self,
         intent: UserIntent,
@@ -295,57 +328,54 @@ impl Rest {
         progress: std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<UploadedAttachment>> {
-        let reqs: Vec<Value> = files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| json!({ "filename": f.filename, "file_size": f.bytes.len(), "id": i.to_string(), "is_clip": false }))
-            .collect();
-        let v: Value = self
-            .write(
-                intent,
-                Method::POST,
-                &format!("/channels/{channel}/attachments"),
-                Some(json!({ "files": reqs })),
-            )
-            .await?;
-        let mut out = Vec::new();
-        let slots = v["attachments"].as_array().cloned().unwrap_or_default();
-        if slots.len() < files.len() {
-            return Err(Error::Other("Discord didn't accept the files. Try again.".into()));
+        // One gesture, one slot request per file: each request redeems an intent of its own, all with the gesture's time.
+        let mut intents = Vec::with_capacity(files.len());
+        let mut rest = intent;
+        for _ in 0..files.len() {
+            let (one, more) = rest.split();
+            intents.push(one);
+            rest = more;
         }
-        for (index, (slot, file)) in slots.into_iter().zip(files).enumerate() {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(Error::Cancelled);
+        let puts = files.into_iter().zip(intents).enumerate().map(|(index, (file, intent))| {
+            let (progress, cancel) = (progress.clone(), cancel.clone());
+            async move {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                // A file the client changed first carries the MD5 of what it was (`buildHeadersForMd5`).
+                let more: Vec<(&'static str, String)> = file.original.iter().map(|o| ("x-discord-original-md5", o.md5.clone())).collect();
+                let v: Value = self
+                    .write_with_headers(
+                        intent,
+                        Method::POST,
+                        &format!("/channels/{channel}/attachments"),
+                        Some(json!({ "files": [slot_request(&file)] })),
+                        more,
+                    )
+                    .await?;
+                let slot = v["attachments"].get(0).cloned().ok_or_else(|| Error::Other("Discord didn't accept the files. Try again.".into()))?;
+                let url = slot["upload_url"].as_str().ok_or_else(|| Error::Decode("no upload_url".into()))?;
+                let on_bytes: std::sync::Arc<dyn Fn(u64) + Send + Sync> = std::sync::Arc::new(move |n| progress(index, n));
+                // The web client sends every file as `application/octet-stream`, whatever it is.
+                let headers = self.identity.upload_put_headers(file.bytes.len());
+                let status = self.transport.put_progress(url, headers, file.bytes, on_bytes, cancel).await?;
+                if !(200..300).contains(&status) {
+                    return Err(if status == 413 {
+                        Error::Http { status, code: None, message: String::new() }
+                    } else {
+                        Error::Other(format!("The upload to Discord failed (HTTP {status}). Try again."))
+                    });
+                }
+                Ok(UploadedAttachment {
+                    description: file.description,
+                    spoiler: file.spoiler,
+                    voice: file.voice,
+                    filename: file.filename,
+                    uploaded_filename: slot["upload_filename"].as_str().unwrap_or_default().to_string(),
+                })
             }
-            let url = slot["upload_url"]
-                .as_str()
-                .ok_or_else(|| Error::Decode("no upload_url".into()))?;
-            let on_bytes: std::sync::Arc<dyn Fn(u64) + Send + Sync> = {
-                let progress = progress.clone();
-                std::sync::Arc::new(move |n| progress(index, n))
-            };
-            let status = self
-                .transport
-                .put_progress(url, &file.content_type, file.bytes, on_bytes, cancel.clone())
-                .await?;
-            if !(200..300).contains(&status) {
-                return Err(if status == 413 {
-                    Error::Http { status, code: None, message: String::new() }
-                } else {
-                    Error::Other(format!("The upload to Discord failed (HTTP {status}). Try again."))
-                });
-            }
-            out.push(UploadedAttachment {
-                description: file.description,
-                spoiler: file.spoiler,
-                voice: file.voice,
-                filename: file.filename,
-                uploaded_filename: slot["upload_filename"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            });
-        }
+        });
+        let out: Vec<UploadedAttachment> = futures_util::future::try_join_all(puts).await?;
         Ok(out)
     }
 }
@@ -397,6 +427,19 @@ mod tests {
         assert!(
             plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none()
         );
+    }
+
+    #[test]
+    fn a_changed_file_says_what_it_was() {
+        let plain = LocalFile { filename: "a.jpg".into(), content_type: "image/jpeg".into(), bytes: bytes::Bytes::from_static(b"x"), description: None, spoiler: false, voice: None, original: None };
+        let v = slot_request(&plain);
+        assert!(v.get("original_content_type").is_none());
+        assert_eq!(v["is_clip"], false);
+        assert_eq!(v["file_size"], 1);
+        let changed = LocalFile { original: Some(OriginalFile { content_type: "image/heic".into(), md5: md5_hex(b"x") }), ..plain };
+        assert_eq!(slot_request(&changed)["original_content_type"], "image/heic");
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
     }
 
     #[test]

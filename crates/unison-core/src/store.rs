@@ -2175,18 +2175,19 @@ impl Store {
         }
     }
 
-    /// Whether a thread is listed in the sidebar under its parent. A joined, unarchived thread shows
-    /// only while it has something for you (unread messages or a mention), is the one you have open,
-    /// or saw a message in the last `THREAD_SIDEBAR_WINDOW_MS`; an old, quiet one lives in the
-    /// Threads popout instead, as in the official client. Not-joined posts of a forum never list.
+    /// Whether a thread is listed in the sidebar under its parent. The thread you are looking at always is,
+    /// whatever it is (quiet, not joined, archived): you are in it, so it has a place on the list until you
+    /// leave. Otherwise a joined, unarchived thread shows only while it has something for you (unread messages
+    /// or a mention) or saw a message in the last `THREAD_SIDEBAR_WINDOW_MS`; an old, quiet one lives in the
+    /// Threads popout instead, as in the official client. Archived threads and not-joined posts never list.
     pub fn thread_in_sidebar(&self, thread: &Channel, now_ms: u64, open: Option<Id>) -> bool {
-        if !thread.is_thread() || thread.is_archived() {
+        if !thread.is_thread() {
             return false;
         }
         if open == Some(thread.id) {
             return true;
         }
-        if thread.member.is_none() {
+        if thread.is_archived() || thread.member.is_none() {
             return false;
         }
         let recent = thread

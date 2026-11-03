@@ -44,6 +44,7 @@ chacha20poly1305 = "0.10"
 audiopus_sys = { version = "0.2", features = ["static"] }
 davey = "=0.1.5"
 rtrb = "0.3"
+md-5 = "0.10"
 
 # Platform audio backends: one per OS, behind `voice::audio::open`. Other OSes add theirs here.
 [target.'cfg(target_os = "macos")'.dependencies]

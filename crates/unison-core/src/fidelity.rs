@@ -308,6 +308,29 @@ impl ClientIdentity {
         ]
     }
 
+    /// Headers of the browser's `PUT` of a file's bytes to the storage URL Discord handed out
+    /// (`CloudUpload.uploadFileWithResumption`: `Content-Type: application/octet-stream`, nothing else of the
+    /// client's own). It is a cross-site CORS request from `https://discord.com`, so it carries the browser identity
+    /// of `rest_headers` without the token, cookies or Discord headers, and `sec-fetch-site: cross-site`. The
+    /// browser's preflight `OPTIONS` before it is not sent. `inferred` from Chromium, not captured.
+    pub fn upload_put_headers(&self, len: usize) -> Vec<(String, String)> {
+        let input = RestHeaderInput {
+            token: None,
+            content_type: Some("application/octet-stream"),
+            content_length: Some(len),
+            sends_origin: true,
+            referer: Some("https://discord.com/"),
+            cookie: None,
+            fingerprint: None,
+            extra: &[],
+        };
+        self.rest_headers(&input)
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("x-discord") && k != "x-super-properties")
+            .map(|(k, v)| if k == "sec-fetch-site" { (k, "cross-site".to_string()) } else { (k, v) })
+            .collect()
+    }
+
     /// Headers on the gateway / remote-auth WebSocket upgrade (Chromium order).
     pub fn websocket_headers(&self) -> Vec<(String, String)> {
         vec![
@@ -405,6 +428,20 @@ mod tests {
             timezone: "Australia/Sydney".into(),
         };
         ClientIdentity::new(IdentityProfile::bundled(), host)
+    }
+
+    #[test]
+    fn the_storage_put_is_a_cross_site_browser_request_without_discord_headers() {
+        let h = ident().upload_put_headers(1234);
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("content-type"), Some("application/octet-stream"));
+        assert_eq!(get("content-length"), Some("1234"));
+        assert_eq!(get("sec-fetch-site"), Some("cross-site"));
+        assert_eq!(get("origin"), Some("https://discord.com"));
+        assert_eq!(get("referer"), Some("https://discord.com/"));
+        for secret in ["authorization", "cookie", "x-super-properties", "x-discord-locale", "x-discord-timezone", "x-fingerprint"] {
+            assert_eq!(get(secret), None, "{secret} must not go to the storage host");
+        }
     }
 
     #[test]

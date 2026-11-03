@@ -53,7 +53,7 @@ Each is a narrow interface; a new platform implements it and nothing else change
 Nothing Unison sends may look like a self-bot, in any build.
 1. Every write needs a `UserIntent` from a real gesture (already enforced).
 2. Automation never uses the network: while `rest::set_automation(true)` (turned on by the first DevTools command, or by a script) every REST call fails with `BlockedByPolicy("automation")`. Perf runs, layout checks, snapshots and agents work on the cache and the open gateway session.
-3. Reads follow human cadence: opening a channel fetches at once only after a pause; opens within 400 ms of the last are debounced (`Session::open_channel`). New fast paths (prefetching, background sweeps) need a reason in `docs/FIDELITY.md` and must be no faster than the official client would be.
+3. Reads follow human cadence: opening a channel fetches at once only after a pause; fetches for opens are never closer than 400 ms (`open_pace`, used by `Session::open_channel`). The one prefetch is the official client's own: a read on mouse-down of a channel or DM row (`Session::preload_channel`, FIDELITY "Channel preload"). New fast paths (prefetching, background sweeps) need a reason in `docs/FIDELITY.md` and must be no faster than the official client would be.
 4. At most one live perf run a day and one instance per token; never loop channel hops, scrolls or snapshots against a live account.
 5. We do not forge integrity values (`launch_signature` stays null; the official client also sends null when its module is unavailable) and do not fake telemetry.
 

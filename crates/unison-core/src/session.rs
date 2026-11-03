@@ -52,12 +52,14 @@ const FOLDER_WRITE_DELAY: Duration = Duration::from_millis(1200);
 
 pub type Emit = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
-/// Opens closer together than this count as one burst (see `open_channel`).
 /// Messages shown on each side of a jumped-to message (the `?around=` page is 50 long).
 const AROUND_HALF: u32 = 25;
 /// Shown when a jump target no longer exists on the server.
 const MESSAGE_GONE: &str = "that message is gone";
-const OPEN_BURST: Duration = Duration::from_millis(400);
+/// A preload's page is the click's page for this long.
+/// The store snapshot is rewritten at most this often by the background flush.
+const STORE_SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+const PRELOAD_FRESH: Duration = Duration::from_secs(10);
 /// A channel already showing its latest page is not fetched again for this long.
 const REFETCH_MIN: Duration = Duration::from_secs(30);
 
@@ -77,8 +79,15 @@ pub struct Session {
     emit: Emit,
     power_tx: watch::Sender<PowerState>,
     selected: Mutex<Option<(Option<Id>, Id)>>,
-    /// When a channel was last opened, so a burst of switches fetches only where it stops.
-    last_open: Mutex<Instant>,
+    /// When the latest page of a channel was last fetched, so a burst of switches fetches only
+    /// where it stops and never faster than `open_pace::GAP`.
+    pace: Mutex<crate::open_pace::OpenPacer>,
+    /// Channels whose latest page is being fetched by a preload (the press before a click); the
+    /// click waits on the signal instead of asking again.
+    preloading: Mutex<std::collections::HashMap<Id, watch::Receiver<bool>>>,
+    /// Channels a preload fetched a moment ago: the click that follows asks for nothing again.
+    preloaded: Mutex<std::collections::HashMap<Id, Instant>>,
+    store_saved_at: Mutex<Option<Instant>>,
     /// Reads already sent or answered (ARCHITECTURE rule 10).
     pub reads: crate::dedupe::Dedupe,
     /// Channel ids the server refused to show (unjoined-thread previews).
@@ -149,7 +158,10 @@ impl Session {
             emit,
             power_tx,
             selected: Mutex::new(None),
-            last_open: Mutex::new(Instant::now() - OPEN_BURST),
+            pace: Default::default(),
+            store_saved_at: Mutex::new(None),
+            preloading: Default::default(),
+            preloaded: Default::default(),
             previews: Default::default(),
             reads: Default::default(),
             search_pages: Default::default(),
@@ -235,7 +247,7 @@ impl Session {
         if let Some(g) = self.gateway.lock().take() {
             g.shutdown();
         }
-        let _ = self.flush_cache();
+        let _ = self.flush_cache(true);
     }
 
     pub fn set_power(&self, p: PowerState) {
@@ -307,7 +319,7 @@ impl Session {
                                 if let Some((g, c)) = *self.selected.lock() {
                                     self.subscribe(g, c);
                                 }
-                                let _ = self.flush_cache();
+                                let _ = self.flush_cache(true);
                             }
                             let p = *power.borrow();
                             let now = Instant::now();
@@ -391,18 +403,32 @@ impl Session {
             if self.gateway.lock().is_none() {
                 return;
             }
-            let _ = self.flush_cache();
+            let _ = self.flush_cache(false);
             unflushed = false;
         }
     }
 
-    fn flush_cache(&self) -> Result<()> {
+    /// Messages are written every flush; the store snapshot (servers, channels, read state: it
+    /// only paints the next launch before READY) at most every `STORE_SNAPSHOT_EVERY`, or when
+    /// `force` (shutdown, READY).
+    fn flush_cache(&self, force: bool) -> Result<()> {
         let channels: Vec<Id> = std::mem::take(&mut *self.dirty.lock());
         for c in channels {
             let msgs: Vec<Message> = self.store.read().history.get(&c).map(|h| h.messages.iter().cloned().collect()).unwrap_or_default();
             self.cache.save_messages(c, &msgs)?;
         }
-        self.cache.save_store(&self.store.read())?;
+        {
+            let mut at = self.store_saved_at.lock();
+            if !force && at.is_some_and(|t| t.elapsed() < STORE_SNAPSHOT_EVERY) {
+                self.cache.put_if_changed("cookies", self.rest.transport.saved_cookies().as_bytes())?;
+                return Ok(());
+            }
+            *at = Some(Instant::now());
+        }
+        // Only the serialization holds the store; a 3 MB snapshot is hashed, compressed and written
+        // with writers (the main thread's cache priming, gateway events) already free again.
+        let json = Cache::store_json(&self.store.read())?;
+        self.cache.save_store_json(json)?;
         self.cache.put_if_changed("cookies", self.rest.transport.saved_cookies().as_bytes())?;
         Ok(())
     }
@@ -446,6 +472,25 @@ impl Session {
         }
     }
 
+    /// The sidebar lists the thread that is open (`Store::thread_in_sidebar`), so opening a thread, or leaving
+    /// one, changes the list: say so, so every shell re-reads it. Opening a thread from its entrance card, the
+    /// Threads popout, a link or a search hit all go through here.
+    fn announce_thread_selection(&self, left: Option<(Option<Id>, Id)>, guild: Option<Id>, channel: Id) {
+        let is_thread = |c: Id| self.store.read().channels.get(&c).is_some_and(|c| c.is_thread());
+        let mut changed: Vec<Option<Id>> = Vec::new();
+        if let Some((g, prev)) = left {
+            if prev != channel && is_thread(prev) {
+                changed.push(g);
+            }
+        }
+        if is_thread(channel) && !changed.contains(&guild) {
+            changed.push(guild);
+        }
+        if !changed.is_empty() {
+            (self.emit)(SessionEvent::Deltas(changed.into_iter().map(|guild| Delta::ChannelsChanged { guild }).collect()));
+        }
+    }
+
     /// Select `channel`: remember it, trim the one left, show the cached page, subscribe. Returns
     /// whether the latest page was already loaded. Shared by every way of opening a channel.
     fn begin_open(&self, guild: Option<Id>, channel: Id) -> bool {
@@ -455,11 +500,13 @@ impl Session {
     /// `show_latest_cache` false keeps whatever window the channel holds (a jump to a message
     /// must not swap a window that already has it for the cached newest page first).
     fn begin_open_with(&self, guild: Option<Id>, channel: Id, show_latest_cache: bool) -> bool {
-        if let Some((_, prev)) = self.selected.lock().replace((guild, channel)) {
+        let left = self.selected.lock().replace((guild, channel));
+        if let Some((_, prev)) = left {
             if prev != channel {
                 self.store.write().trim_history(prev, 50);
             }
         }
+        self.announce_thread_selection(left, guild, channel);
         self.rest.set_location(guild, Some(channel));
         self.identity.touch();
         let has_history = self.store.read().history.get(&channel).is_some_and(|h| h.at_latest);
@@ -518,34 +565,51 @@ impl Session {
 
     pub async fn open_channel(self: &Arc<Self>, guild: Option<Id>, channel: Id, intent: Option<UserIntent>) -> Result<()> {
         let has_history = self.begin_open(guild, channel);
+        // The press that led to this click already started the read (`preload_channel`): wait for
+        // it and use its page. Nothing is asked twice (UX.md 6.5).
+        let pending = self.preloading.lock().get(&channel).cloned();
+        if let Some(mut done) = pending {
+            let _ = done.wait_for(|d| *d).await;
+        }
+        let just_preloaded = self.preloaded.lock().remove(&channel).is_some_and(|t| t.elapsed() < PRELOAD_FRESH);
+        if just_preloaded {
+            return self.ack_if_unread(channel, intent).await;
+        }
         // A person can't read channels faster than a few per second; a script or a held arrow key can.
-        // The first open after a pause fetches at once; an open that follows another within
-        // `OPEN_BURST` waits it out and fetches only if it is still the channel on screen. The
-        // cached messages above are already showing, so nothing waits visibly.
-        let burst = {
-            let mut last = self.last_open.lock();
-            let burst = last.elapsed() < OPEN_BURST;
-            *last = Instant::now();
-            burst
-        };
-        if burst {
-            tokio::time::sleep(OPEN_BURST).await;
+        // Fetches for opens are never closer than `open_pace::GAP`: an open that comes sooner waits
+        // out the rest of the gap and fetches only if it is still the channel on screen. The cached
+        // messages above are already showing, so nothing waits visibly.
+        let wait = self.pace.lock().wait(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
             if *self.selected.lock() != Some((guild, channel)) {
                 return Ok(());
             }
         }
         // Already showing the latest page, fed by the gateway, and nothing unread to acknowledge:
         // opening it again within `REFETCH_MIN` asks for nothing new.
-        let key = format!("msgs:{channel}");
-        let unread_now = {
-            let s = self.store.read();
-            s.channels.get(&channel).is_some_and(|c| s.is_unread(c)) || s.mention_count(channel) > 0
-        };
+        let unread_now = self.is_unread_now(channel);
         let ttl = if has_history && !unread_now { REFETCH_MIN } else { Duration::ZERO };
-        if !self.reads.begin(&key, ttl) {
+        if !self.load_latest(channel, ttl, false).await? {
             return Ok(());
         }
-        let fresh = match self.rest.messages(channel, None, 50).await {
+        self.ack_if_unread(channel, intent).await
+    }
+
+    fn is_unread_now(&self, channel: Id) -> bool {
+        let s = self.store.read();
+        s.channels.get(&channel).is_some_and(|c| s.is_unread(c)) || s.mention_count(channel) > 0
+    }
+
+    /// Fetch the newest page of `channel` into the store. False when nothing was asked (the same
+    /// read is in flight, or fresh within `ttl`).
+    async fn load_latest(&self, channel: Id, ttl: Duration, preload: bool) -> Result<bool> {
+        let key = format!("msgs:{channel}");
+        if !self.reads.begin(&key, ttl) {
+            return Ok(false);
+        }
+        self.pace.lock().started(Instant::now());
+        let fresh = match self.rest.messages(channel, None, 50, preload).await {
             Ok(f) => f,
             Err(e) => {
                 self.reads.finish(&key, false);
@@ -554,19 +618,55 @@ impl Session {
         };
         self.reads.finish(&key, true);
         let full = fresh.len() == 50;
-        let newest = fresh.first().map(|m| m.id);
         self.store.write().set_history_latest(channel, fresh, full);
         self.dirty.lock().push(channel);
         (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
+        Ok(true)
+    }
 
-        let unread = {
-            let s = self.store.read();
-            s.channels.get(&channel).is_some_and(|c| s.is_unread(c)) || s.mention_count(channel) > 0
-        };
-        if let (true, Some(last), Some(intent)) = (unread, newest, intent) {
+    /// Acknowledge the channel's newest message when it is unread and a gesture opened it.
+    async fn ack_if_unread(&self, channel: Id, intent: Option<UserIntent>) -> Result<()> {
+        let newest = self.store.read().history.get(&channel).and_then(|h| h.messages.iter().rev().find(|m| m.id.0 != 0).map(|m| m.id));
+        if let (true, Some(last), Some(intent)) = (self.is_unread_now(channel), newest, intent) {
             self.rest.ack(intent, channel, last).await?;
         }
         Ok(())
+    }
+
+    /// The press that precedes a click on a channel row: start reading its newest page, as the
+    /// official client does on mouse-down (`ChannelActionCreators.preload`, FIDELITY "Channel
+    /// open"), so the click finds it loaded. Needs the gesture (presence only: a read). A channel
+    /// that already has its newest page, a burst (a fetch went out less than `open_pace::GAP`
+    /// ago) and a channel we do not list are skipped: the click's own open handles them. It
+    /// acknowledges nothing: only the click's open does, so a press that ends elsewhere reads
+    /// without marking anything read.
+    pub async fn preload_channel(self: &Arc<Self>, channel: Id, intent: Option<&UserIntent>) -> Result<()> {
+        let worth = {
+            let s = self.store.read();
+            s.channels.get(&channel).is_some_and(|c| c.is_text_like() && s.permissions(c) & perm::READ_MESSAGE_HISTORY != 0) && !s.history.get(&channel).is_some_and(|h| h.at_latest)
+        };
+        if intent.is_none() || !worth || !self.pace.lock().may_preload(Instant::now()) {
+            return Ok(());
+        }
+        let (tx, rx) = watch::channel(false);
+        {
+            let mut p = self.preloading.lock();
+            if p.contains_key(&channel) {
+                return Ok(());
+            }
+            p.insert(channel, rx);
+        }
+        let r = self.load_latest(channel, REFETCH_MIN, true).await;
+        {
+            let mut done = self.preloaded.lock();
+            done.retain(|_, t| t.elapsed() < PRELOAD_FRESH);
+            if matches!(r, Ok(true)) {
+                done.insert(channel, Instant::now());
+            }
+        }
+        self.preloading.lock().remove(&channel);
+        let _ = tx.send(true);
+        r.map(|_| ())
     }
 
     /// Make a thread this account has not joined viewable, the way the official client does when a
@@ -625,11 +725,13 @@ impl Session {
     /// Open a forum or media channel: subscribe the guild (active posts arrive as
     /// THREAD_LIST_SYNC), then load the first archived page for the chosen view.
     pub async fn open_forum(self: &Arc<Self>, guild: Id, forum: Id, query: ForumQuery) -> Result<()> {
-        if let Some((_, prev)) = self.selected.lock().replace((Some(guild), forum)) {
+        let left = self.selected.lock().replace((Some(guild), forum));
+        if let Some((_, prev)) = left {
             if prev != forum {
                 self.store.write().trim_history(prev, 50);
             }
         }
+        self.announce_thread_selection(left, Some(guild), forum);
         self.rest.set_location(Some(guild), Some(forum));
         self.identity.touch();
         self.subscribe(Some(guild), forum);
@@ -1073,7 +1175,7 @@ impl Session {
     pub async fn load_older(&self, channel: Id) -> Result<bool> {
         let oldest = self.store.read().history.get(&channel).and_then(|h| h.messages.front().map(|m| m.id));
         let Some(before) = oldest else { return Ok(false) };
-        let page = self.rest.messages(channel, Some(before), 50).await?;
+        let page = self.rest.messages(channel, Some(before), 50, false).await?;
         let full = page.len() == 50;
         self.store.write().prepend_history(channel, page, full);
         (self.emit)(SessionEvent::Deltas(vec![Delta::MessagesReset { channel }]));
@@ -1160,18 +1262,17 @@ impl Session {
                 vec![]
             } else {
                 let (store, emit) = (self.store.clone(), self.emit.clone());
-                let last_emit = Arc::new(Mutex::new(std::time::Instant::now()));
+                let batch = Arc::new(Mutex::new(crate::send_state::ProgressBatch::new(named.len(), std::time::Instant::now())));
                 let progress: Arc<dyn Fn(usize, u64) + Send + Sync> = Arc::new(move |i, n| {
                     let now = std::time::Instant::now();
+                    // Pieces are gathered, so the store is locked and the shells are told about ten times a second.
+                    let Some(through) = batch.lock().push(i, n, now) else { return };
                     if let Some(s) = store.write().sends.iter_mut().find(|s| s.nonce == nonce) {
-                        s.add(i, n, now);
+                        for (file, bytes) in through.into_iter().enumerate().filter(|(_, b)| *b > 0) {
+                            s.add(file, bytes, now);
+                        }
                     }
-                    // About ten updates a second is plenty for a bar.
-                    let mut last = last_emit.lock();
-                    if now.duration_since(*last) >= std::time::Duration::from_millis(100) {
-                        *last = now;
-                        emit(SessionEvent::Deltas(vec![Delta::Sends { channel }]));
-                    }
+                    emit(SessionEvent::Deltas(vec![Delta::Sends { channel }]));
                 });
                 let sent = self.rest.upload_attachments(upload_intent, channel, files, progress, cancel.clone()).await?;
                 if let Some(s) = self.store.write().sends.iter_mut().find(|s| s.nonce == nonce) {
@@ -2376,7 +2477,7 @@ mod send_tests {
     }
 
     fn file(name: &str, bytes: usize) -> LocalFile {
-        LocalFile { filename: name.into(), content_type: "application/zip".into(), bytes: bytes::Bytes::from(vec![0; bytes]), description: None, spoiler: false, voice: None }
+        LocalFile { filename: name.into(), content_type: "application/zip".into(), bytes: bytes::Bytes::from(vec![0; bytes]), description: None, spoiler: false, voice: None, original: None }
     }
 
     #[tokio::test]

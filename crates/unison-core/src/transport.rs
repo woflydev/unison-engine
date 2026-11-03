@@ -158,6 +158,8 @@ impl Transport {
             Engine::Rustls(
                 reqwest::Client::builder()
                     .use_rustls_tls()
+                    // The default 64 KiB window caps one upload stream at window / round-trip time.
+                    .http2_adaptive_window(true)
                     .redirect(reqwest::redirect::Policy::none())
                     .pool_idle_timeout(Duration::from_secs(90))
                     .tcp_keepalive(Duration::from_secs(60))
@@ -215,20 +217,19 @@ impl Transport {
         })
     }
 
-    /// Like [`put_raw`](Self::put_raw) but the body is fed in 64 KiB pieces: `on_bytes` hears about
-    /// each piece as the connection takes it, and setting `cancel` ends the request with
+    /// Like [`put_raw`](Self::put_raw), with the caller's whole header list (it carries `content-length`), but the body is fed in 64 KiB pieces: `on_bytes` hears about
+    /// each 256 KiB piece as the connection takes it, and setting `cancel` ends the request with
     /// [`Error::Cancelled`]. Costs nothing while idle: no timers, only the pulls the socket makes.
     pub async fn put_progress(
         &self,
         url: &str,
-        content_type: &str,
+        headers: Vec<(String, String)>,
         body: bytes::Bytes,
         on_bytes: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<u16> {
         use std::sync::atomic::Ordering;
-        const CHUNK: usize = 64 * 1024;
-        let len = body.len();
+        const CHUNK: usize = 256 * 1024;
         let data = body;
         let flag = cancel.clone();
         let stream = futures_util::stream::unfold(0usize, move |at| {
@@ -246,19 +247,20 @@ impl Transport {
             }
         });
         let result: Result<u16> = match &self.client {
-            Engine::Chrome(c, _) => c
-                .put(url)
-                .header("content-type", content_type)
-                .header("content-length", len.to_string())
-                .body(wreq::Body::wrap_stream(stream))
-                .send()
-                .await
-                .map(|r| r.status().as_u16())
-                .map_err(Error::from),
+            Engine::Chrome(c, _) => {
+                let (map, order) = wreq_headers(&headers)?;
+                c.put(url)
+                    .headers(map)
+                    .orig_headers(order)
+                    .body(wreq::Body::wrap_stream(stream))
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .map_err(Error::from)
+            }
             Engine::Rustls(c) => c
                 .put(url)
-                .header("content-type", content_type)
-                .header("content-length", len.to_string())
+                .headers(header_map(headers)?)
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
                 .await
@@ -447,7 +449,7 @@ mod upload_tests {
         let seen = Arc::new(AtomicU64::new(0));
         let s = seen.clone();
         let body = bytes::Bytes::from(vec![7u8; 300_000]);
-        let status = t.put_progress(&url, "application/zip", body, Arc::new(move |n| { s.fetch_add(n, Ordering::Relaxed); }), Arc::new(AtomicBool::new(false))).await.unwrap();
+        let status = t.put_progress(&url, vec![("content-type".into(), "application/zip".into()), ("content-length".into(), "300000".into())], body, Arc::new(move |n| { s.fetch_add(n, Ordering::Relaxed); }), Arc::new(AtomicBool::new(false))).await.unwrap();
         assert_eq!(status, 200);
         assert_eq!(seen.load(Ordering::Relaxed), 300_000);
         assert_eq!(srv.await.unwrap(), 300_000, "the server received the whole body");
@@ -457,7 +459,7 @@ mod upload_tests {
     async fn a_refusal_status_is_returned_not_thrown() {
         let (url, _srv) = server(413).await;
         let t = Transport::new(None).unwrap();
-        let status = t.put_progress(&url, "x/y", bytes::Bytes::from(vec![1; 10]), Arc::new(|_| {}), Arc::new(AtomicBool::new(false))).await.unwrap();
+        let status = t.put_progress(&url, vec![("content-type".into(), "x/y".into()), ("content-length".into(), "10".into())], bytes::Bytes::from(vec![1; 10]), Arc::new(|_| {}), Arc::new(AtomicBool::new(false))).await.unwrap();
         assert_eq!(status, 413);
     }
 
@@ -469,7 +471,7 @@ mod upload_tests {
         let flag = cancel.clone();
         // Cancel as soon as the first piece has been taken.
         let r = t
-            .put_progress(&url, "x/y", bytes::Bytes::from(vec![0; 5_000_000]), Arc::new(move |_| flag.store(true, Ordering::Relaxed)), cancel)
+            .put_progress(&url, vec![("content-type".into(), "x/y".into()), ("content-length".into(), "5000000".into())], bytes::Bytes::from(vec![0; 5_000_000]), Arc::new(move |_| flag.store(true, Ordering::Relaxed)), cancel)
             .await;
         assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
     }

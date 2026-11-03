@@ -93,6 +93,8 @@ impl VoiceNoteRecorder {
             description: None,
             voice_secs: Some(f.duration_secs),
             voice_waveform: Some(f.waveform),
+            original_content_type: None,
+            original_md5: None,
         })
     }
 }

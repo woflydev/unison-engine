@@ -43,7 +43,7 @@ pub use auth::{LoginOutcome, MfaChallenge};
 pub use forums::NewForumPost;
 pub use nav::{channel_override_body, mute_body, SearchQuery, MUTE_WINDOWS};
 pub(crate) use messages::attachment_json;
-pub use messages::{ForwardSource, LocalFile, OutgoingMessage, UploadedAttachment, VoiceMeta};
+pub use messages::{md5_hex, ForwardSource, LocalFile, OriginalFile, OutgoingMessage, UploadedAttachment, VoiceMeta};
 
 /// Longest we will wait on our own for a rate-limit reset before surfacing it to the UI.
 const MAX_SILENT_WAIT: Duration = Duration::from_secs(5);
@@ -175,6 +175,24 @@ impl Rest {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// A write that carries extra request headers (lowercase names).
+    pub async fn write_with_headers<T: DeserializeOwned>(
+        &self,
+        intent: UserIntent,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        headers: Vec<(&'static str, String)>,
+    ) -> Result<T> {
+        intent.redeem()?;
+        self.pace(&method, path)?;
+        let bytes = self.request_full(method, path, body, None, None, headers).await?;
+        if bytes.is_empty() {
+            return Ok(serde_json::from_value(Value::Null)?);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     /// A write that carries an audit-log reason.
     pub async fn write_reason<T: DeserializeOwned>(
         &self,
@@ -234,6 +252,18 @@ impl Rest {
         captcha: Option<CaptchaSolution>,
         reason: Option<&str>,
     ) -> Result<bytes::Bytes> {
+        self.request_full(method, path, body, captcha, reason, Vec::new()).await
+    }
+
+    async fn request_full(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        captcha: Option<CaptchaSolution>,
+        reason: Option<&str>,
+        more: Vec<(&'static str, String)>,
+    ) -> Result<bytes::Bytes> {
         if AUTOMATION.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::BlockedByPolicy("automation"));
         }
@@ -258,6 +288,7 @@ impl Rest {
         if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
             extra.push(("x-audit-log-reason", audit_reason_header(r)));
         }
+        extra.extend(more);
 
         for attempt in 0..2 {
             let token = self.token();

@@ -155,6 +155,11 @@ pub struct ThreadChip {
     pub joined: bool,
     pub archived: bool,
     pub unread: bool,
+    /// When the thread last had a message (ms since the epoch, from the id of its newest message), 0 if unknown.
+    pub active_ms: u64,
+    /// Who said the newest message the account has loaded of this thread, and the start of it ("Sam: see you
+    /// there"), mentions as names; empty when none is loaded (the entrance then shows only the count).
+    pub preview: String,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -286,6 +291,18 @@ pub(crate) fn thread_chip(s: &Store, m: &Message) -> Option<ThreadChip> {
         joined: live.member.is_some(),
         archived: live.is_archived(),
         unread: live.member.is_some() && s.is_unread(live) && !s.is_channel_muted(live),
+        active_ms: live.last_message_id.map_or(0, |m| m.timestamp_ms()),
+        // An archived thread is over: its newest message is not news, so the card does not show it.
+        preview: if live.is_archived() { String::new() } else { s
+            .history
+            .get(&live.id)
+            .and_then(|h| h.messages.iter().rev().find(|m| m.id.0 != 0))
+            .map(|m| {
+                let text = crate::messages::preview_text(s, live.guild_id, &m.content, 90);
+                let who = s.display_name(live.guild_id, m.author.id);
+                if text.is_empty() { format!("{who}: attachment") } else { format!("{who}: {text}") }
+            })
+            .unwrap_or_default() },
     })
 }
 

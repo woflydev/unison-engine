@@ -853,7 +853,8 @@ fn old_quiet_threads_leave_the_sidebar() {
     assert!(s.thread_in_sidebar(&stale, now, None), "unread: shown");
     let mut archived = thread(4, Some(at(1_000)), true);
     archived.thread_metadata = Some(json!({ "archived": true }));
-    assert!(!s.thread_in_sidebar(&archived, now, Some(crate::snowflake::Snowflake(4))), "archived never lists");
+    assert!(!s.thread_in_sidebar(&archived, now, None), "archived never lists");
+    assert!(s.thread_in_sidebar(&archived, now, Some(crate::snowflake::Snowflake(4))), "except the one you are viewing");
 }
 
 #[test]

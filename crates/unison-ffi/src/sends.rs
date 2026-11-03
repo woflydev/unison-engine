@@ -99,7 +99,7 @@ impl UnisonEngine {
             files: r
                 .files
                 .into_iter()
-                .map(|f| FileUpload { filename: f.filename, content_type: f.content_type, bytes: f.bytes.to_vec(), spoiler: f.spoiler, description: f.description, voice_secs: f.voice.as_ref().map(|v| v.duration_secs), voice_waveform: f.voice.map(|v| v.waveform) })
+                .map(|f| FileUpload { filename: f.filename, content_type: f.content_type, bytes: f.bytes.to_vec(), spoiler: f.spoiler, description: f.description, voice_secs: f.voice.as_ref().map(|v| v.duration_secs), voice_waveform: f.voice.map(|v| v.waveform), original_content_type: f.original.as_ref().map(|o| o.content_type.clone()), original_md5: f.original.map(|o| o.md5) })
                 .collect(),
             reply_to: r.reply_to.map(|r| r.to_string()),
             mention_reply: r.mention_reply,

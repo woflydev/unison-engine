@@ -245,6 +245,11 @@ pub struct FileUpload {
     pub voice_secs: Option<f64>,
     #[uniffi(default = None)]
     pub voice_waveform: Option<String>,
+    /// Set when the shell converted or shrank the file: its type before, and the MD5 of its bytes before (`content_md5`).
+    #[uniffi(default = None)]
+    pub original_content_type: Option<String>,
+    #[uniffi(default = None)]
+    pub original_md5: Option<String>,
 }
 
 impl FileUpload {
@@ -256,6 +261,7 @@ impl FileUpload {
             description: self.description,
             spoiler: self.spoiler,
             voice: self.voice_secs.zip(self.voice_waveform).map(|(duration_secs, waveform)| unison_core::rest::VoiceMeta { duration_secs, waveform }),
+            original: self.original_content_type.zip(self.original_md5).map(|(content_type, md5)| unison_core::rest::OriginalFile { content_type, md5 }),
         }
     }
 }
@@ -479,7 +485,10 @@ pub(crate) fn system_text(s: &Store, guild: Option<Id>, m: &Message) -> Option<S
     })
 }
 
-/// Author grouping: the rule lives here so every shell draws the same blocks.
+/// Author grouping: the rule lives here so every shell draws the same blocks. A message that started a
+/// thread leads from its author's picture to its thread's card, so two such messages in a row are two
+/// blocks, each with its own picture (as Discord draws them): a line cannot start from a picture that is
+/// not there.
 fn mark_grouped(items: &mut [MessageItem]) {
     for i in 1..items.len() {
         let (p, m) = (&items[i - 1], &items[i]);
@@ -487,11 +496,45 @@ fn mark_grouped(items: &mut [MessageItem]) {
             && m.reply.is_none()
             && m.system_text.is_none()
             && p.system_text.is_none()
+            && !(p.thread.is_some() && m.thread.is_some())
             && m.timestamp_ms.saturating_sub(p.timestamp_ms) < 7 * 60 * 1000;
     }
 }
 
+/// A transcript never points at where it already is: inside a thread, the message it started (shown as the
+/// thread's first row) carries no entrance to the thread you are reading.
+fn hide_entrances_to(items: &mut [MessageItem], channel: &str) {
+    for it in items.iter_mut() {
+        if it.thread.as_ref().is_some_and(|t| t.id == channel) {
+            it.thread = None;
+        }
+    }
+}
+
+/// The first row of a thread made from a message: Discord sends a type-21 message with no content
+/// whose `referenced_message` is the original. The official client draws the original there (author,
+/// text, pictures), not a reply line to it. The row keeps the starter's id and channel, so anything done
+/// to it asks the thread, and drops the original's reactions, which live on the message in the parent.
+pub(crate) fn thread_starter_as_message(m: &Message) -> Option<Message> {
+    if m.kind != message_type::THREAD_STARTER_MESSAGE {
+        return None;
+    }
+    let orig = m.referenced_message.as_deref()?;
+    let mut shown = orig.clone();
+    shown.id = m.id;
+    shown.channel_id = m.channel_id;
+    shown.guild_id = m.guild_id.or(orig.guild_id);
+    shown.kind = message_type::DEFAULT;
+    shown.message_reference = None;
+    shown.referenced_message = None;
+    shown.reactions.clear();
+    Some(shown)
+}
+
 pub(crate) fn message_item(s: &Store, guild: Option<Id>, m: &Message) -> MessageItem {
+    if let Some(shown) = thread_starter_as_message(m) {
+        return message_item(s, guild, &shown);
+    }
     // A reply whose original is gone: the web client says so instead of hiding the line.
     let reply_deleted = m.referenced_message.is_none()
         && m.kind == message_type::REPLY
@@ -682,6 +725,7 @@ impl UnisonEngine {
                 .map(|h| {
                     let mut items: Vec<MessageItem> =
                         h.messages.iter().map(|m| message_item(s, guild, m)).collect();
+                    hide_entrances_to(&mut items, &channel_id);
                     mark_grouped(&mut items);
                     items
                 })
@@ -712,6 +756,13 @@ impl UnisonEngine {
                 .is_some_and(|h| h.has_more_before)
         })
         .unwrap_or(false)
+    }
+
+    /// Has the core read this channel's messages (from the network or the disk cache)? False for a
+    /// channel never opened before: its first page is still on its way, which is when the shell
+    /// shows a spinner rather than an empty transcript.
+    pub fn is_channel_loaded(&self, account_id: String, channel_id: String) -> bool {
+        self.with_store(&account_id, |s| s.history.contains_key(&id(&channel_id))).unwrap_or(false)
     }
 
     /// False after a jump-to: the window is detached from the newest messages.
@@ -1114,6 +1165,74 @@ mod bench {
 }
 
 #[cfg(test)]
+mod grouping_tests {
+    use super::*;
+    use unison_core::model::Channel;
+    use unison_core::snowflake::Snowflake;
+
+    fn msg(id: u64, thread: Option<u64>) -> Message {
+        let mut m = Message { id: Snowflake(id), channel_id: Snowflake(1), content: "hi".into(), ..Default::default() };
+        m.author.id = Snowflake(7);
+        m.thread = thread.map(|t| Channel { id: Snowflake(t), name: Some("t".into()), ..Default::default() });
+        m
+    }
+
+    fn items(ms: &[Message]) -> Vec<MessageItem> {
+        let s = Store::default();
+        let mut v: Vec<MessageItem> = ms.iter().map(|m| message_item(&s, None, m)).collect();
+        mark_grouped(&mut v);
+        v
+    }
+
+    #[test]
+    fn two_threads_on_consecutive_messages_are_two_blocks() {
+        let one = items(&[msg(1 << 22, Some(100)), msg(2 << 22, Some(101))]);
+        assert!(!one[1].grouped, "the second message needs its own picture for its line to start from");
+        // Only one of them has a thread: still one block.
+        assert!(items(&[msg(1 << 22, None), msg(2 << 22, Some(101))])[1].grouped);
+        assert!(items(&[msg(1 << 22, Some(100)), msg(2 << 22, None)])[1].grouped);
+    }
+
+    #[test]
+    fn a_thread_never_has_an_entrance_to_itself() {
+        let mut v = items(&[msg(1 << 22, Some(100)), msg(2 << 22, Some(101))]);
+        hide_entrances_to(&mut v, "100");
+        assert!(v[0].thread.is_none(), "reading thread 100: no door to thread 100");
+        assert!(v[1].thread.is_some(), "other threads keep theirs");
+    }
+}
+
+#[cfg(test)]
+mod starter_tests {
+    use super::*;
+    use unison_core::snowflake::Snowflake;
+
+    #[test]
+    fn a_thread_starter_shows_the_original_message_in_the_thread() {
+        let orig = Message { id: Snowflake(5), channel_id: Snowflake(1), content: "the first post".into(), ..Default::default() };
+        let starter = Message {
+            id: Snowflake(9),
+            channel_id: Snowflake(2),
+            kind: message_type::THREAD_STARTER_MESSAGE,
+            referenced_message: Some(Box::new(orig)),
+            ..Default::default()
+        };
+        let s = Store::default();
+        let item = message_item(&s, None, &starter);
+        assert_eq!((item.id.as_str(), item.channel_id.as_str()), ("9", "2"), "the row belongs to the thread");
+        assert!(item.reply.is_none(), "not a reply line");
+        assert!(item.supported && item.system_text.is_none());
+        assert!(item.content.text.contains("the first post"));
+    }
+
+    #[test]
+    fn a_starter_whose_original_is_gone_is_left_alone() {
+        let starter = Message { id: Snowflake(9), kind: message_type::THREAD_STARTER_MESSAGE, ..Default::default() };
+        assert!(thread_starter_as_message(&starter).is_none());
+    }
+}
+
+#[cfg(test)]
 mod resolve_tests {
     use super::*;
     use unison_core::model::Role;
@@ -1127,6 +1246,26 @@ mod resolve_tests {
         assert_eq!(preview_text(&s, Some(Snowflake(100)), "ping <@&5>", 80), "ping @Mods");
         assert_eq!(preview_text(&s, None, "<@&9>", 80), "@deleted-role", "a role that really is gone");
     }
+}
+
+/// One message a drag-selection across the transcript touches (`unison_core::selection_copy`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct SelectionPart {
+    pub author: String,
+    pub time_label: String,
+    pub text: String,
+    pub grouped: bool,
+    pub system: bool,
+}
+
+/// The text a selection across messages puts on the clipboard: name lines for each block, then the lines.
+#[uniffi::export]
+pub fn selection_copy_text(parts: Vec<SelectionPart>) -> String {
+    let parts: Vec<unison_core::selection_copy::Part> = parts
+        .into_iter()
+        .map(|p| unison_core::selection_copy::Part { author: p.author, time_label: p.time_label, text: p.text, grouped: p.grouped, system: p.system })
+        .collect();
+    unison_core::selection_copy::copy_text(&parts)
 }
 
 /// Where to scroll for a jump to a loaded message (`unison_core::jump_scroll`): `None` when the

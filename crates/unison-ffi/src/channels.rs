@@ -450,6 +450,19 @@ impl UnisonEngine {
         });
     }
 
+    /// The press that precedes a click on a channel or DM row (mouse-down): reads the newest page
+    /// now so the click finds it loaded, as the official client does. A read: it changes and
+    /// acknowledges nothing, and the core skips it when the page is loaded or a fetch just went out.
+    pub fn preload_channel(&self, account_id: String, channel_id: String, gesture: UserGesture) {
+        let Some(s) = self.inner.session(id(&account_id)) else {
+            return;
+        };
+        let intent = gesture.intent();
+        self.inner.rt.spawn(async move {
+            let _ = s.preload_channel(id(&channel_id), Some(&intent)).await;
+        });
+    }
+
     /// `gesture` is `None` when the shell restores a view on its own (launch); nothing is acked then.
     pub fn open_channel(
         &self,
